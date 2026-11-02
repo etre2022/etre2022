@@ -22,6 +22,7 @@ jobs:
       LOGU: ${{ matrix.logu }}
       MAPPING: ${{ matrix.mapping }}
     steps:
+      - uses: actions/checkout@v4
       - name: Original MIT RTL elaborate synthesize and 2-seed PNR
         shell: bash
         run: |
