@@ -1,0 +1,153 @@
+name: B197 GDN persistent state reset semantics
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_GDN_native_reset_semantics.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  kernel-vs-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 19
+    steps:
+      - name: Build upstream unmodified GDN kernel against Xilinx Apache-2.0 simulation-only AP library
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence objects
+          exec > >(tee evidence/full_job_stdout_stderr.log) 2>&1
+          trap 'rc=$?; echo "B197_GDN_NATIVE_AP_JOB_EXIT=$rc"; date -u -Is' EXIT
+          echo 'B197_SCOPE=NATIVE_CPP_KERNEL_SIM_OPEN_SOURCE_AP_TYPES_NOT_VITIS_NOT_FPGA_PPA'
+          date -u -Is; uname -a; cat /etc/os-release
+          g++ --version | head -1
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgmp-dev
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream_gdn
+          git -C upstream_gdn checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream_gdn rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          git clone --filter=blob:none --no-checkout https://github.com/Xilinx/HLS_arbitrary_Precision_Types.git apache_ap
+          git -C apache_ap checkout --detach 200a9aecaadf471592558540dc5a88256cbf880f
+          test "$(git -C apache_ap rev-parse HEAD)" = 200a9aecaadf471592558540dc5a88256cbf880f
+          test -f apache_ap/include/ap_int.h
+          test -f apache_ap/LICENSE.TXT
+          grep -q 'Apache License' apache_ap/LICENSE.TXT || grep -q 'Apache' apache_ap/README.MD
+          {
+            echo "UPSTREAM_GDN_COMMIT=$(git -C upstream_gdn rev-parse HEAD)"
+            echo "AP_SIM_COMMIT=$(git -C apache_ap rev-parse HEAD)"
+            echo "UPSTREAM_DECODE_GIT_BLOB=$(git -C upstream_gdn hash-object src/decode.cpp)"
+            echo "UPSTREAM_WEIGHT_GIT_BLOB=$(git -C upstream_gdn hash-object src/weight.cpp)"
+            echo "AP_HEADER_GIT_BLOB=$(git -C apache_ap hash-object include/ap_int.h)"
+            echo "UPSTREAM_GDN_LICENSE_FOUND=$(git -C upstream_gdn ls-files | grep -Ei '(^|/)(LICENSE|COPYING|NOTICE)(\.|$)' | wc -l)"
+          } | tee evidence/provenance.txt
+          sha256sum upstream_gdn/src/decode.cpp upstream_gdn/src/weight.cpp upstream_gdn/src/config.hpp apache_ap/include/ap_int.h upstream_gdn/model/tinystories15M_q8.bin > evidence/original_sha256.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,struct,json
+          p=Path('upstream_gdn/model/tinystories15M_q8.bin')
+          original=p.read_bytes()
+          assert struct.unpack_from('<I',original,0)[0]==0x47444e65
+          assert struct.unpack_from('<i',original,4)[0]==2
+          assert struct.unpack_from('<i',original,40)[0]==256
+          changed=bytearray(original)
+          struct.pack_into('<i',changed,40,1024)
+          changes=[i for i,(a,b) in enumerate(zip(original,changed)) if a!=b]
+          assert changes==[41],changes
+          Path('/tmp/B197_gdn_native_ap_header_shim.bin').write_bytes(changed)
+          out={'original_checkpoint_sha256':hashlib.sha256(original).hexdigest(),'metadata_compat_shim_sha256':hashlib.sha256(changed).hexdigest(),'changed_offsets':changes,'upstream_cpp_files_modified':False,'scope':'SINGLE_BYTE_CHECKPOINT_METADATA_SHIM_ONLY'}
+          Path('evidence/checkpoint_shim_provenance.json').write_text(json.dumps(out,indent=2))
+          print('B197_CHECKPOINT_META_ONLY',json.dumps(out))
+          PY
+          # Only change the harness build include path. Original upstream C++ is never edited.
+          FLAGS="-O2 -std=c++20 -Wall -Wextra -Wno-unknown-pragmas -ffp-contract=off -Iupstream_gdn/src -Iapache_ap/include"
+          echo "BUILD_FLAGS=$FLAGS" > evidence/build_flags.txt
+          echo BUILD_STAGE_KERNEL_START
+          timeout 360s g++ $FLAGS -DBUILD_DECODE_KERNEL -c upstream_gdn/src/decode.cpp -o objects/decode_kernel.o 2>&1 | tee evidence/compile_kernel.log
+          echo BUILD_STAGE_CPU_START
+          timeout 360s g++ $FLAGS -DUSE_CPU_ONLY -c upstream_gdn/src/decode.cpp -o objects/decode_cpu.o 2>&1 | tee evidence/compile_cpu.log
+          timeout 240s g++ $FLAGS -c upstream_gdn/src/weight.cpp -o objects/weight.o 2>&1 | tee evidence/compile_weight.log
+          timeout 240s g++ $FLAGS -DUSE_CPU_ONLY -c upstream_gdn/tools/kernel_sim.cpp -o objects/kernel_sim.o 2>&1 | tee evidence/compile_kernel_sim.log
+          timeout 120s g++ objects/decode_kernel.o objects/decode_cpu.o objects/weight.o objects/kernel_sim.o -lm -lgmp -o objects/kernel_sim 2>&1 | tee evidence/link.log
+          echo B197_UNMODIFIED_GDN_KERNEL_NATIVE_COMPILE_PASS
+          set +e
+          timeout 360s ./objects/kernel_sim /tmp/B197_gdn_native_ap_header_shim.bin 16 > evidence/kernel_vs_cpu_16_steps.log 2>&1
+          RC=$?
+          set -e
+          echo "B197_KERNEL_SIM_EXIT_CODE=$RC"
+          tail -40 evidence/kernel_vs_cpu_16_steps.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          text=Path('evidence/kernel_vs_cpu_16_steps.log').read_text(errors='replace')
+          steps=re.findall(r'^step\s+(\d+)\s+token\s+(\d+)\s+kernel\s+(\d+)\s+cpu\s+(\d+)\s+(ok|MISMATCH)\s*$',text,re.M)
+          result={'scope':'UNMODIFIED_GDN_HLS_CPP_NATIVE_WITH_XILINX_OPEN_SOURCE_AP_TYPES_NOT_VITIS_CSIM_NOT_FPGA','steps_detected':len(steps),'matched':sum(int(s[4]=='ok') for s in steps),'mismatched':sum(int(s[4]!='ok') for s in steps),'details':steps,'kernel_sim_stdout_tail':text[-1100:]}
+          Path('evidence/B197_native_kernel_sim_summary.json').write_text(json.dumps(result,indent=2))
+          print('B197_NATIVE_KERNEL_SIM_RESULTS',json.dumps({k:v for k,v in result.items() if k!='details' and k!='kernel_sim_stdout_tail'}))
+          PY
+          echo "VITIS_VPP=$(command -v v++ || echo not_installed)"
+          echo "VITIS_RTL_SIM=$(command -v xsim || echo not_installed)"
+          echo "B197_GDN_SIM_STATUS=$RC"
+          if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+          echo B197_GDN_NATIVE_KERNEL_16STEP_PASS
+          # Original C++ kernel called as-is; this independent harness checks reset_state across two sequences.
+          cat > evidence/reset_harness.cpp <<'CPP'
+          #include "decode.hpp"
+          #include "weight.hpp"
+          #include <ap_int.h>
+          #include <vector>
+          #include <string>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          extern "C" void decode(int token,int reset_state,const ap_uint<128>* packed_params,const float* side,uint32_t* next_token);
+          static std::vector<ap_uint<128>> PackBeats(const std::vector<uint8_t>& blob){
+            std::vector<ap_uint<128>> out(blob.size()/16);
+            for(size_t i=0;i<out.size();++i){
+              ap_uint<128> x=0;
+              for(int k=0;k<16;k++) x.range(k*8+7,k*8)=blob[i*16+k];
+              out[i]=x;
+            }
+            return out;
+          }
+          int main(int argc,char** argv){
+            if(argc!=2) return 91;
+            gdn::Weights w; gdn::LoadWeights(w,argv[1]);
+            auto packed=PackBeats(gdn::PackParameters(w));
+            auto side=gdn::BuildFp32Side(w);
+            int drive[16]={1,9038,2501,263,931,29892,297,263,2319,4726,4257,4726,29892,10600,1023,1900};
+            uint32_t first[16]={};
+            int mismatches=0;
+            for(int pass=0;pass<2;pass++){
+              gdn::RunState cpu;
+              std::vector<float> logits(gdn::kVocabSize,0.f);
+              for(int t=0;t<16;t++){
+                uint32_t kernel_next=0;
+                decode(drive[t],t==0?1:0,packed.data(),side.data(),&kernel_next);
+                gdn::CpuForward(cpu,w,drive[t],logits.data());
+                int expected=gdn::ArgmaxLogits(logits.data(),gdn::kVocabSize);
+                if(kernel_next!=(uint32_t)expected) mismatches++;
+                if(pass==0) first[t]=kernel_next;
+                else if(kernel_next!=first[t]) mismatches++;
+                printf("RESET_CYCLE pass=%d step=%d input=%d kernel=%u cpu=%d baseline=%u %s\n",pass,t,drive[t],kernel_next,expected,first[t],(kernel_next==(uint32_t)expected&&kernel_next==first[t])?"ok":"MISMATCH");
+              }
+            }
+            printf("B197_GDN_RESET_RESULT steps=32 mismatches=%d\n",mismatches);
+            if(mismatches) return 77;
+            puts("B197_GDN_NATIVE_RESET_2X16_PASS");
+            return 0;
+          }
+          CPP
+          timeout 240s g++ $FLAGS -DUSE_CPU_ONLY -c evidence/reset_harness.cpp -o objects/reset_harness.o 2>&1 | tee evidence/compile_reset_harness.log
+          timeout 180s g++ objects/decode_kernel.o objects/decode_cpu.o objects/weight.o objects/reset_harness.o -lm -lgmp -o objects/reset_harness 2>&1 | tee evidence/link_reset_harness.log
+          timeout 420s ./objects/reset_harness /tmp/B197_gdn_native_ap_header_shim.bin > evidence/reset_harness_32_steps.log 2>&1
+          tail -38 evidence/reset_harness_32_steps.log
+          grep -q '^B197_GDN_NATIVE_RESET_2X16_PASS' evidence/reset_harness_32_steps.log
+          echo B197_GDN_NATIVE_RESET_FUNCTIONAL_PASS_NOT_VITIS
+      - name: Archive simulation logs and results, omit copyrighted source/model
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-native-AP-state-reset-semantics
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: warn
