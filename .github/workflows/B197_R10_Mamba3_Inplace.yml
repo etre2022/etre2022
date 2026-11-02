@@ -1,0 +1,69 @@
+name: B197 R10 Mamba3 duplicate-state in-place native counterfactual
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R10_Mamba3_Inplace.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-dual-run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 11
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive isolated in-place state variant and compare all 245760 output words bitwise
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs work
+          exec > >(tee logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_R10_INPLACE_CI_EXIT=$rc"; date -u -Is' EXIT
+          echo "B197_SCOPE=NATIVE_CPP_BITWISE_EQUIVALENCE_ABLATION_NOT_VITIS_NOT_FPGA"
+          date -u -Is; g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/rohitmandapati/mamba3-hls.git upstream
+          git -C upstream checkout --detach a380d1b8ccc503fe42459056d3627201d101927d
+          test "$(git -C upstream rev-parse HEAD)" = a380d1b8ccc503fe42459056d3627201d101927d
+          test -e upstream/src/hls/data/seq_9/step_63/x.bin
+          sha256sum upstream/src/hls/mamba3_step.cpp upstream/src/hls/mamba3_step_test.cpp b197/r10_inplace_patch.py >logs/upstream_sha256.txt
+          python3 b197/r10_inplace_patch.py
+          FLAGS="-O2 -std=c++17 -Wno-unknown-pragmas -DMAMBA3_NSTEPS=64 -DMAMBA3_USE_FIXED_POINT=0 -DMAMBA3_FORCE_XILINX_HEADERS=0 -Iupstream/src/hls"
+          g++ $FLAGS -Ddut=dut_original -c upstream/src/hls/mamba3_step.cpp -o work/original.o
+          g++ $FLAGS -Ddut=dut_inplace -c work/inplace.cpp -o work/inplace.o
+          g++ $FLAGS -c work/dual_test.cpp -o work/dual_tb.o
+          g++ work/original.o work/inplace.o work/dual_tb.o -lm -o work/native_test
+          ln -s upstream/src/hls/data data
+          timeout 120s work/native_test > logs/native_dual_golden.log 2>&1
+          tail -19 logs/native_dual_golden.log
+          grep -q 'B197_R10_INPLACE_STATE_NATIVE_BIT_EXACT_PASS words=245760 sequences=10 steps=64' logs/native_dual_golden.log
+          grep -q 'PASS.*threshold=0.0001' logs/native_dual_golden.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          s=Path('logs/native_dual_golden.log').read_text()
+          assert s.count('| out max err:')==640
+          assert 'B197_INPLACE_MISMATCH' not in s
+          assert 'B197_R10_INPLACE_STATE_NATIVE_BIT_EXACT_PASS words=245760 sequences=10 steps=64' in s
+          m=json.loads(Path('logs/inplace_provenance.json').read_text())
+          r={'status':'ORIGINAL_VS_INPLACE_NATIVE_BITWISE_PASS',
+             'pinned_upstream':m['baseline_commit'],
+             'changed_HLS_source':True,'math_expression_changes':0,
+             'verified_32bit_output_words':245760,'model_steps':640,
+             'state_scalars':8192,'state_copy_assignments_removed_per_call':524288,
+             'raw_bram18_copy_baseline_from_thirdparty_synthesis_report':16,
+             'fpga_state_BRam_savings_actual':None,'fpga_PPA':False,
+             'engineering_novelty':'KILL_STANDARD_INPLACE_MEMORY'},
+          Path('logs/native_inplace_summary.json').write_text(json.dumps(r,indent=2))
+          print('B197_R10_INPLACE_GATE_PASS',json.dumps(r))
+          PY
+          sha256sum logs/native_dual_golden.log logs/inplace_provenance.json logs/native_inplace_summary.json >logs/result_sha256.txt
+      - name: Preserve only own patch script + logs, not unlicensed third-party original/derivative source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R10-Mamba3-inplace-native-ablation
+          path: |
+            logs/
+            b197/r10_inplace_patch.py
+          if-no-files-found: warn
+          retention-days: 7
