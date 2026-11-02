@@ -25,8 +25,10 @@ static void b197_trace_q(const char* side,const char* stage,int token,int layer,
 }
 """
 needle="namespace gdn {"
-assert traced.count(needle)==1
-traced=traced.replace(needle,helper+"\n"+needle,1)
+assert traced.count(needle)==3, "expected three upstream namespaces"
+# Emit the helper in the two mutually exclusive BUILD_DECODE_KERNEL and
+# CPU-reference translation units. The third namespace is host glue.
+traced=traced.replace(needle,helper+"\n"+needle,2)
 
 def before(needle,addition):
     global traced
