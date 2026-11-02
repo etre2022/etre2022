@@ -1,0 +1,61 @@
+name: B197 GDN full native host with metadata-only checkpoint shim
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_native_host_e2e.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Execute unchanged upstream full-model C++ host on 16 tokens using 1-byte checkpoint header shim
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs
+          exec > >(tee logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_GDN_HOST_EXIT=$rc"; date -u -Is' EXIT
+          date -u -Is
+          echo "B197_SCOPE=NATIVE_CPU_FULL_MODEL_E2E_ADAPTED_METADATA_ONLY_NOT_FPGA"
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          cp upstream/model/tinystories15M_q8.bin /tmp/B197_gdn_meta_header_only.bin
+          python3 - <<'PY'
+          import hashlib,struct,json
+          from pathlib import Path
+          src=Path('upstream/model/tinystories15M_q8.bin').read_bytes()
+          p=Path('/tmp/B197_gdn_meta_header_only.bin');b=bytearray(p.read_bytes())
+          assert struct.unpack_from('<i',b,40)[0]==256
+          struct.pack_into('<i',b,40,1024)
+          assert [i for i,(x,y) in enumerate(zip(src,b)) if x!=y]==[41]
+          p.write_bytes(b)
+          print('B197_HEADER_SHIM_SINGLE_BYTE_CONFIRMED')
+          Path('logs/metadata_check.json').write_text(json.dumps({'original_checkpoint_sha256':hashlib.sha256(src).hexdigest(),'shim_checkpoint_sha256':hashlib.sha256(b).hexdigest(),'changed_offsets':[41],'not_upstream_original_checkpoint':True},indent=2))
+          PY
+          cmake -S upstream -B upstream/build -DCMAKE_BUILD_TYPE=Release 2>&1 | tee logs/config.log
+          cmake --build upstream/build -j2 2>&1 | tee logs/build.log
+          test -x upstream/build/gdn_host
+          set +e
+          timeout 120s upstream/build/gdn_host --weight_path /tmp/B197_gdn_meta_header_only.bin --vocab_path upstream/model/tokenizer.bin --max_seq 16 --temp 0 -i "Once" > logs/full_model_greedy.log 2>&1
+          RC=$?
+          set -e
+          echo "B197_GDN_FULL_HOST_RETURN=$RC"
+          tail -30 logs/full_model_greedy.log
+          if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+          grep -q 'Speed:' logs/full_model_greedy.log
+          echo B197_GDN_FULL_MODEL_NATIVE_CPU_GREEDY_PASS
+          echo 'VITIS:'; command -v v++ || echo unavailable
+          echo 'BITSTREAM:'; ls upstream/outputs/link/*.xclbin 2>&1 || true
+          sha256sum logs/metadata_check.json logs/full_model_greedy.log > logs/sha256.txt
+      - name: Preserve full-model native logs, no model checkpoint redistribution
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-full-model-native-CPU-e2e
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
