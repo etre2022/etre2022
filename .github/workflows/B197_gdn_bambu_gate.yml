@@ -57,7 +57,7 @@ jobs:
               "$GITHUB_WORKSPACE/upstream_checkout/gdn/src/decode.cpp" --top-fname=decode \
               --compiler=I386_CLANG16 --device-name=LFE5U85F,8,BG756C \
               --clock-period=12.5 --generate-interface=INFER \
-              -I"$GITHUB_WORKSPACE/b197/native_only_compat" \
+              -I"$GITHUB_WORKSPACE/b197/bambu_only_compat" \
               -I"$GITHUB_WORKSPACE/upstream_checkout/gdn/src" -DBUILD_DECODE_KERNEL -O2 -lm \
               > ../B197_logs/bambu_hls.log 2>&1
           )
