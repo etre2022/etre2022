@@ -1,0 +1,77 @@
+name: B197 GDN native diversity mismatch and reset diagnostic
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_diversity_diagnostic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Diagnose native CPP HLS kernel against CPU and A-B-A resets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs build
+          exec > >(tee logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_DIVERSITY_TEST_EXIT=$rc"; date -u -Is' EXIT
+          echo 'SCOPE=DIAGNOSTIC_NATIVE_CXX_ONLY__NOT_CSIM__NOT_RTL__NOT_FPGA'
+          date -u -Is
+          g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,struct,json
+          a=Path('upstream/model/tinystories15M_q8.bin').read_bytes()
+          assert hashlib.sha256(a).hexdigest()=='63fe5c9bca6bbf7abfd05ab5c67e9fb58d8ba25d4184a65d22e04c9179e78b64'
+          b=bytearray(a)
+          assert struct.unpack_from('<i',b,40)[0]==256
+          struct.pack_into('<i',b,40,1024)
+          assert [i for i,(x,y) in enumerate(zip(a,b)) if x!=y]==[41]
+          Path('/tmp/B197_gdn_shim.bin').write_bytes(b)
+          print('B197_FIXED_ONE_BYTE_META_CONTRACT')
+          PY
+          sha256sum upstream/src/decode.cpp upstream/src/weight.cpp b197/native_only_compat/ap_int.h b197/native_only_compat/test_diversity_diagnostic.cpp >logs/input_sha256.txt
+          F="-O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas -Ib197/native_only_compat -Iupstream/src"
+          g++ $F -DBUILD_DECODE_KERNEL -c upstream/src/decode.cpp -o build/kernel.o
+          g++ $F -DUSE_CPU_ONLY -c upstream/src/decode.cpp -o build/cpu.o
+          g++ $F -c upstream/src/weight.cpp -o build/weight.o
+          g++ $F -DUSE_CPU_ONLY -c b197/native_only_compat/test_diversity_diagnostic.cpp -o build/test.o
+          g++ build/kernel.o build/cpu.o build/weight.o build/test.o -lm -o build/test
+          set +e
+          timeout 150s build/test /tmp/B197_gdn_shim.bin >logs/diversity_raw.log 2>&1
+          RC=$?
+          set -e
+          echo "B197_DIAGNOSTIC_PROCESS_EXIT=$RC"
+          cat logs/diversity_raw.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          a=Path('logs/diversity_raw.log').read_text()
+          m=re.search(r'B197_DIVERSITY_FINAL compared=(\d+) mismatches=(\d+) repeated_native_difference=(-?\d+) repeated_cpu_difference=(-?\d+) max_cpu_margin_over_native=([\deE+.-]+)',a)
+          assert m is not None,'Missing final counters'
+          n,d,rn,rc=[int(x) for x in m.groups()[:4]]
+          z={'scope':'native_compatibility_diagnostic_NOT_HLS_OR_FPGA','source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d','compared':n,'top1_mismatches':d,'reset_A_B_A_native_differences':rn,'reset_A_B_A_cpu_differences':rc,'max_cpu_margin_over_native':float(m.group(5)),'vitis_csim':False,'vitis_rtl':False,'ppa':False}
+          assert n==448
+          Path('logs/B197_diversity.json').write_text(json.dumps(z,indent=2))
+          print('B197_DIVERSITY_DIAGNOSTIC_RECORDED',json.dumps(z))
+          PY
+          # mismatch is a *measured result*, not a tool execution error.
+          if [ "$RC" -ne 0 ]; then echo "B197_RESET_REPLAY_FAILED exit_code=$RC"; exit "$RC"; fi
+      - name: Retain raw logs/testbench/shim; exclude unlicensed upstream source and model
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-diversity-reset-diagnostic
+          path: |
+            logs/
+            b197/native_only_compat/ap_int.h
+            b197/native_only_compat/test_diversity_diagnostic.cpp
+          retention-days: 8
+          if-no-files-found: warn
