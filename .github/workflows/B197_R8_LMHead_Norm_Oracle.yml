@@ -1,0 +1,73 @@
+name: B197 R8 optimistic GDN LM head norm-bound oracle gate
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R8_LMHead_Norm_Oracle.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  norm-bound:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test loose and groupwise Cauchy bounds against real GDN model logits
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p B197_R8_oracle
+          exec > >(tee B197_R8_oracle/full.log) 2>&1
+          trap 'rc=$?; echo "B197_R8_NORM_EXIT=$rc"; date -u -Is' EXIT
+          echo 'B197_SCOPE=NATIVE_CPU_ORACLE_CANDIDATE_POTENTIAL_NOT_HARDWARE_NOT_EXACT_FP32_PROOF'
+          date -u -Is
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          sha256sum upstream/src/decode.cpp upstream/src/weight.cpp upstream/model/tinystories15M_q8.bin b197/r8_head_norm_oracle.cpp > B197_R8_oracle/source_sha256.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,struct
+          p=Path('upstream/model/tinystories15M_q8.bin')
+          b=bytearray(p.read_bytes())
+          assert hashlib.sha256(b).hexdigest()=='63fe5c9bca6bbf7abfd05ab5c67e9fb58d8ba25d4184a65d22e04c9179e78b64'
+          assert struct.unpack_from('<i',b,40)[0]==256
+          struct.pack_into('<i',b,40,1024)
+          assert hashlib.sha256(b).hexdigest()=='7dbe38e0115c94cdeff3f4acb7127a74efddd8843c7915c287a928d57ba497f0'
+          Path('/tmp/B197_R8_head_oracle.bin').write_bytes(b)
+          print('B197_R8_MODEL_HEADER_SHIM_PINNED')
+          PY
+          g++ -O2 -std=c++20 -ffp-contract=off -fno-fast-math -DUSE_CPU_ONLY -Iupstream/src upstream/src/decode.cpp upstream/src/weight.cpp b197/r8_head_norm_oracle.cpp -lm -o /tmp/B197_R8_head_oracle
+          timeout 180s /tmp/B197_R8_head_oracle /tmp/B197_R8_head_oracle.bin > B197_R8_oracle/oracle.log
+          cat B197_R8_oracle/oracle.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json,csv
+          s=Path('B197_R8_oracle/oracle.log').read_text()
+          pattern=r'B197_R8_NORM_ORACLE seq=(\d+) step=(\d+) token=(\d+) top1=(\d+) best=([\deE.+-]+) global_skippable=(\d+) group_skippable=(\d+) rows=(\d+) margin=0.01'
+          hits=re.findall(pattern,s)
+          assert len(hits)==19,len(hits)
+          rows=[]
+          for a in hits:
+              seq,step,token,top1,best,ng,npop,full=a
+              ng=int(ng);npop=int(npop);full=int(full)
+              assert full==32000 and 0<=ng<=npop<=full
+              rows.append({'seq':int(seq),'step':int(step),'token':int(token),'top1':int(top1),'best':float(best),'global_skippable':ng,'group_skippable':npop,'vocab':full})
+          g=sum(x['global_skippable'] for x in rows)/len(rows)/32000
+          p=sum(x['group_skippable'] for x in rows)/len(rows)/32000
+          out={'source':'real GDN CPU checkpoint, native double Cauchy norm oracle (upper bound), not hardware','source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d','n_queries':19,'oracle_best_score_is_free':True,'float_margin':0.01,'vocab_size':32000,'global_row_norm_metadata_bytes':128000,'group_norm_metadata_bytes':1024000,'average_optimistic_global_prune_fraction':g,'average_optimistic_group_prune_fraction':p,'rows':rows,'proof_claim':'none; FP32 rounding not formally bounded','logical_FPGA_PPA':'none'}
+          Path('B197_R8_oracle/oracle_summary.json').write_text(json.dumps(out,indent=2))
+          with Path('B197_R8_oracle/oracle_rows.csv').open('w',newline='') as f:
+             w=csv.DictWriter(f,fieldnames=rows[0].keys());w.writeheader();w.writerows(rows)
+          print('B197_R8_ORACLE_GATE_PASS',json.dumps({'rows':len(rows),'avg_global_screen':g,'avg_group_screen':p,'max_group_screen':max(x['group_skippable'] for x in rows)/32000}))
+          PY
+      - name: Retain only independent test and logs, no upstream model or unlicensed source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R8-GDN-head-norm-oracle
+          path: |
+            B197_R8_oracle/
+            b197/r8_head_norm_oracle.cpp
+          retention-days: 8
+          if-no-files-found: warn
