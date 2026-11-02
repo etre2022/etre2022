@@ -1,0 +1,79 @@
+name: B197 GDN CPU quantization rounding controlled ablation
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_rounding_ablation.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  numeric-ablation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare unchanged CPU with one-line nearbyint CPU diagnostic against same native kernel
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs build
+          exec > >(tee logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_ROUNDING_GATE_EXIT=$rc"; date -u -Is' EXIT
+          echo 'SCOPE=NATIVE_CXX_CPU_ROUNDING_DIAGNOSTIC_ONLY_NOT_HLS_NOT_FPGA'
+          date -u -Is
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,struct,json
+          p=Path('upstream/model/tinystories15M_q8.bin')
+          a=p.read_bytes()
+          assert hashlib.sha256(a).hexdigest()=='63fe5c9bca6bbf7abfd05ab5c67e9fb58d8ba25d4184a65d22e04c9179e78b64'
+          b=bytearray(a);assert struct.unpack_from('<i',b,40)[0]==256
+          struct.pack_into('<i',b,40,1024)
+          assert [i for i,(x,y) in enumerate(zip(a,b)) if x!=y]==[41]
+          Path('/tmp/b197_hdr.bin').write_bytes(b)
+          old=Path('upstream/src/decode.cpp').read_text()
+          assert old.count('std::lround(')==1
+          new=old.replace('std::lround(','std::nearbyint(')
+          Path('build/decode_rounding_ablation.cpp').write_text(new)
+          print('B197_ISOLATED_CPU_EDIT_IS_SINGLE_QUANTIZE_ROUNDING_CALL')
+          Path('logs/patch.json').write_text(json.dumps({'source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d','only_replacement':'std::lround -> std::nearbyint in CPU Quantize','source_sha256':hashlib.sha256(old.encode()).hexdigest(),'diagnostic_cpu_sha256':hashlib.sha256(new.encode()).hexdigest(),'not_upstream_baseline':True},indent=2))
+          PY
+          F="-O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas -Ib197/native_only_compat -Iupstream/src"
+          g++ $F -DBUILD_DECODE_KERNEL -c upstream/src/decode.cpp -o build/kernel.o
+          g++ $F -DUSE_CPU_ONLY -c upstream/src/decode.cpp -o build/cpu_orig.o
+          g++ $F -DUSE_CPU_ONLY -c build/decode_rounding_ablation.cpp -o build/cpu_rounding.o
+          g++ $F -c upstream/src/weight.cpp -o build/weight.o
+          g++ $F -DUSE_CPU_ONLY -c b197/native_only_compat/test_diversity_diagnostic.cpp -o build/test.o
+          g++ build/kernel.o build/cpu_orig.o build/weight.o build/test.o -lm -o build/orig
+          g++ build/kernel.o build/cpu_rounding.o build/weight.o build/test.o -lm -o build/nearby
+          timeout 120s build/orig /tmp/b197_hdr.bin > logs/orig.log 2>&1
+          timeout 120s build/nearby /tmp/b197_hdr.bin > logs/nearby.log 2>&1
+          grep 'B197_DIVERSITY_FINAL' logs/orig.log
+          grep 'B197_DIVERSITY_FINAL' logs/nearby.log
+          python3 - <<'PY'
+          import re,json
+          from pathlib import Path
+          z={}
+          for name in ['orig','nearby']:
+              s=Path('logs/'+name+'.log').read_text()
+              m=re.search(r'B197_DIVERSITY_FINAL compared=(\d+) mismatches=(\d+) repeated_native_difference=(\d+) repeated_cpu_difference=(\d+) max_cpu_margin_over_native=([\deE+.-]+)',s)
+              assert m, ('missing B197 final',name)
+              z[name]={'points':int(m.group(1)),'mismatches':int(m.group(2)),'reset_native_differences':int(m.group(3)),'reset_cpu_differences':int(m.group(4)),'max_gap':float(m.group(5))}
+              assert z[name]['points']==448
+              assert z[name]['reset_native_differences']==0 and z[name]['reset_cpu_differences']==0
+          z['delta_mismatches']=z['nearby']['mismatches']-z['orig']['mismatches']
+          z['scope']='native math ablation only, not original CPU source for nearby version; not FPGA'
+          Path('logs/result.json').write_text(json.dumps(z,indent=2))
+          print('B197_ROUNDING_ABLATION_PASS',json.dumps(z))
+          PY
+      - name: Archive numerical logs and patch metadata, not upstream source/weights
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-CPU-rounding-ablation
+          path: logs/
+          retention-days: 8
+          if-no-files-found: warn
