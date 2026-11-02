@@ -1,0 +1,122 @@
+name: B197 GDN upstream recurrence numerical contract
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_recurrence_numeric.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  numerical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - name: Extract unchanged upstream recurrence_head and compare independent FP32 serial recurrence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs
+          exec > >(tee logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_GDN_NUMERIC_EXIT=$rc"; date -u -Is' EXIT
+          date -u -Is
+          g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,re
+          t=Path('upstream/src/decode.cpp').read_text()
+          a=t.index('static inline float fadd(')
+          b=t.index('static inline float siluf(float x);',a)
+          c=t.index('static void recurrence_head(')
+          d=t.index('static void head_rmsnorm_gated(',c)
+          fragments=t[a:b]+'\n'+t[c:d]
+          # Keep the original upstream code unmodified, with Vitis pragmas ignored by g++.
+          header='#include <cmath>\n#include <algorithm>\n#include <cstdint>\n#include <cstdio>\n#include <random>\n#include <cstring>\n#include <limits>\nconstexpr int kAccStages=8,kStateBanks=16,kHeadKDim=32,kHeadVDim=32,kStateGroups=2;\n'
+          Path('upstream_fragment.cpp').write_text(header+fragments)
+          Path('logs/extraction_provenance.txt').write_text('\n'.join([
+              'upstream_commit=45a7e14315d78e2c38b93e740cb0e4fb3f032c4d',
+              'source_file=src/decode.cpp',
+              'original_cpp_sha256='+hashlib.sha256(t.encode()).hexdigest(),
+              'extraction=fadd+clear_acc+reduce_acc+recurrence_head verbatim',
+              'upstream_recursion_lines='+str(t[:c].count('\n')+1)+'..'+str(t[:d].count('\n')),
+              'warning=host g++ ignores Vitis HLS scheduling pragmas; NOT hardware simulation',
+              'warning=the reference below is independent flat-state sequential FP32 recurrence'
+          ])+'\n')
+          print(Path('logs/extraction_provenance.txt').read_text())
+          PY
+          cat > numeric_ref.cpp <<'CPP'
+          static uint32_t Bits(float f){
+            uint32_t v;
+            std::memcpy(&v,&f,sizeof(v));
+            return v;
+          }
+          int main(){
+            std::mt19937 gen(197);
+            std::uniform_real_distribution<float> xdist(-.25f,.25f);
+            std::uniform_real_distribution<float> bdist(.02f,.98f);
+            std::uniform_real_distribution<float> ddist(.30f,.999f);
+            float max_sdiff=0.f,max_odiff=0.f;
+            uint64_t scount=0,ocount=0,sbits=0,obits=0;
+            int nonzero_cases=0;
+            for(int trial=0;trial<512;trial++){
+              float s0[32][32],scpu[32][32],shls[16][32][2],q[32],k[32],v[32],ocpu[32],ohls[32];
+              const bool valid=(trial%5)!=0;
+              for(int i=0;i<32;i++){
+                q[i]=xdist(gen); k[i]=xdist(gen);v[i]=xdist(gen);
+                for(int j=0;j<32;j++){s0[i][j]=xdist(gen);scpu[i][j]=s0[i][j];shls[j%16][i][j/16]=s0[i][j];}
+              }
+              float beta=bdist(gen), decay=ddist(gen);
+              recurrence_head(shls,q,k,v,beta,decay,valid,ohls);
+              // CPU original reference order (src/decode.cpp around original lines 824..835).
+              for(int i=0;i<32;i++)for(int j=0;j<32;j++)scpu[i][j]=(valid?scpu[i][j]:0.0f)*decay;
+              float delta[32];
+              for(int j=0;j<32;j++){
+                float prediction=0.f;
+                for(int i=0;i<32;i++) prediction += scpu[i][j]*k[i];
+                delta[j]=(v[j]-prediction)*beta;
+              }
+              for(int i=0;i<32;i++)for(int j=0;j<32;j++)scpu[i][j]+=k[i]*delta[j];
+              for(int j=0;j<32;j++){
+                float value=0.f;
+                for(int i=0;i<32;i++) value += q[i]*scpu[i][j];
+                ocpu[j]=value;
+              }
+              for(int i=0;i<32;i++)for(int j=0;j<32;j++){
+                const float a=shls[j%16][i][j/16],b=scpu[i][j];
+                if(!std::isfinite(a)||!std::isfinite(b)) return 72;
+                float diff=std::abs(a-b);
+                if(diff>max_sdiff)max_sdiff=diff;
+                sbits+=(Bits(a)==Bits(b));scount++;
+              }
+              for(int j=0;j<32;j++){
+                const float a=ohls[j],b=ocpu[j];
+                if(!std::isfinite(a)||!std::isfinite(b)) return 73;
+                float diff=std::abs(a-b);
+                if(diff>max_odiff)max_odiff=diff;
+                obits+=(Bits(a)==Bits(b));ocount++;
+              }
+              if(valid)nonzero_cases++;
+            }
+            std::printf("B197_GDN_RECURRENCE_NATIVE_COMPARE samples=512 valid=%d state_points=%llu output_points=%llu state_equal=%llu output_equal=%llu max_abs_state=%.9g max_abs_output=%.9g\n",
+                      nonzero_cases,(unsigned long long)scount,(unsigned long long)ocount,(unsigned long long)sbits,(unsigned long long)obits,(double)max_sdiff,(double)max_odiff);
+            if(max_sdiff>1e-4f||max_odiff>1e-4f) return 74;
+            std::puts("B197_GDN_RECURRENCE_NATIVE_NUMERIC_PASS_not_HLS_simulation");
+            return 0;
+          }
+          CPP
+          # Include original extracted function by translation-unit compilation, do not reproduce it in archive.
+          cat upstream_fragment.cpp numeric_ref.cpp > numerics.cpp
+          g++ -O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas numerics.cpp -o numerics
+          ./numerics 2>&1 | tee logs/numerical_comparison.log
+          echo 'HLS tools:'; command -v v++ || echo VITIS_UNAVAILABLE
+          sha256sum numeric_ref.cpp logs/numerical_comparison.log > logs/output_hashes.txt
+          cp numeric_ref.cpp logs/independent_numeric_reference.cpp
+      - name: Archive numerical outputs (no redistribution of unlicensed original source code)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-native-recurrence-numerical-gate
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
