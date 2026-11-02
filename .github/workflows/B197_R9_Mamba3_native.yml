@@ -52,8 +52,8 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import os
-          print("B197_R9_GOLDEN_SEQ_COUNT",sum(Path('upstream/src/hls/data').glob('seq_*/step_0/x.bin')))
-          print("B197_R9_GOLDEN_STEP63_PRESENT",sum(Path('upstream/src/hls/data').glob('seq_*/step_63/x.bin')))
+          print("B197_R9_GOLDEN_SEQ_COUNT",len(list(Path('upstream/src/hls/data').glob('seq_*/step_0/x.bin'))))
+          print("B197_R9_GOLDEN_STEP63_PRESENT",len(list(Path('upstream/src/hls/data').glob('seq_*/step_63/x.bin'))))
           PY
           # The original testbench loads data relative to working directory.
           # Symbolic links are runtime local; not uploaded as derivative upstream files.
