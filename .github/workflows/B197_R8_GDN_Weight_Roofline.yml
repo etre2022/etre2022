@@ -1,0 +1,113 @@
+name: B197 R8 GDN weight-stream source and capacity gate
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R8_GDN_Weight_Roofline.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  weight-accounting:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile original config and calculate conditional serial-HP bandwidth/recurrence limits
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p B197_R8_logs
+          exec > >(tee B197_R8_logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_R8_JOB_EXIT=$rc"; date -u -Is' EXIT
+          date -u -Is
+          echo 'B197_SCOPE=SOURCE_DERIVED_ANALYTIC_BOUND_NO_PHYSICAL_REPRODUCTION'
+          uname -a
+          g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = '45a7e14315d78e2c38b93e740cb0e4fb3f032c4d'
+          sha256sum upstream/src/config.hpp upstream/src/decode.cpp upstream/scripts/build_hls.sh upstream/scripts/build_link.sh upstream/README.md > B197_R8_logs/upstream_sha256.txt
+          grep -q '108.849 token/s' upstream/README.md
+          grep -q 'recurrence 为 354 cycles/head' upstream/README.md
+          grep -q 'clock=150MHz' upstream/scripts/build_hls.sh
+          grep -q -- '--connectivity.sp decode_1.packed_params:HP0' upstream/scripts/build_link.sh
+          grep -q -- 'HLS PIPELINE II = 4' upstream/src/decode.cpp
+          grep -q -- 'HLS ALLOCATION function instances = q8_linear limit = 1' upstream/src/decode.cpp
+          grep -q -- 'max_read_burst_length = 256 num_read_outstanding = 16' upstream/src/decode.cpp
+          g++ -std=c++20 -O2 -Iupstream/src b197/r8_original_config_account.cpp -o /tmp/B197_R8_account
+          /tmp/B197_R8_account | tee B197_R8_logs/original_compiled_constants.log
+          python3 - <<'PY'
+          import json,math
+          from pathlib import Path
+          p=Path('B197_R8_logs/original_compiled_constants.log').read_text().splitlines()
+          assert p[0]=='B197_R8_COMPILED_CONFIG_PASS'
+          s=json.loads(p[1])
+          # These values derive from actual compiler-evaluated upstream constants.
+          words=s['packed_weight_words']
+          assert words==273024 and s['weight_beats_128b']==1092096
+          II=4
+          MHz=150.0
+          # SUPPLIED BY AUTHOR README, NOT INDEPENDENT FPGA MEASURED.
+          reported_M2_tps=108.849
+          reported_head_latency_cycles=354
+          flops=s['total_FP32_state_bytes']/4
+          k26_URAM288=64
+          k26_BRAM36=144
+          URAM_bytes=k26_URAM288*(288*1024//8)
+          BRAM_bytes=k26_BRAM36*(36*1024//8)
+          nominal_raw_onchip=URAM_bytes+BRAM_bytes
+          min_weight_cycles=words*II
+          min_weight_time_ms=min_weight_cycles/(MHz*1000)
+          implied_ms=1000/reported_M2_tps
+          residual_ms=implied_ms-min_weight_time_ms
+          full_state_only_ideal_cycles=reported_head_latency_cycles*s['layers']*s['heads_per_layer']
+          head_latency_ms=full_state_only_ideal_cycles/(MHz*1000)
+          payload=s['packed_weight_bytes']
+          output={
+            'kind':'PINNED_SOURCE_DERIVED_AND_CONDITIONAL_ANALYTIC_NEVER_PHYSICAL',
+            'source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d',
+            'target':'K26 KV260 XCK26, but NOT independently routed',
+            'author_reported_steady_tps':reported_M2_tps,
+            'author_reported_recurrence_latency_cycles_per_head':reported_head_latency_cycles,
+            'kernel_clock_mhz':MHz,'q8_target_II_per_512bit_word':II,
+            'bytes_per_packed_weight_word':64,'weight_words_per_token':words,
+            'weight_bytes_per_token':payload,
+            'extra_embedding_weight_bytes':s['embedding_extra_weight_bytes'],
+            'serialized_Q8_engine_stream_cycles_min':min_weight_cycles,
+            'serialized_Q8_engine_stream_time_ms_min':min_weight_time_ms,
+            'conditional_stream_only_tps_ceiling':1000/min_weight_time_ms,
+            'author_implied_mean_ms_per_token':implied_ms,
+            'stream_fraction_of_author_time':min_weight_time_ms/implied_ms,
+            'conditional_all_nonstream_removed_speedup_cap':implied_ms/min_weight_time_ms,
+            'non_stream_total_ms_upper_residual':residual_ms,
+            'recurrence_64_heads_latency_cycle_sum':full_state_only_ideal_cycles,
+            'recurrence_64_heads_latency_ms_if_serial':head_latency_ms,
+            'recurrence_fraction_of_author_time_if_serial':head_latency_ms/implied_ms,
+            'conditional_all_recurrence_removed_speedup_cap':implied_ms/(implied_ms-head_latency_ms),
+            'raw_K26_URAM_blocks':k26_URAM288,'raw_K26_BRAM36_blocks':k26_BRAM36,
+            'raw_K26_URAM_bytes':URAM_bytes,'raw_K26_BRAM_bytes':BRAM_bytes,
+            'raw_K26_URAM_plus_BRAM_bytes':nominal_raw_onchip,
+            'weight_capacity_to_raw_onchip_ratio':payload/nominal_raw_onchip,
+            'state_bytes_FP32':s['total_FP32_state_bytes'],
+            'comparison_contract':'one shared Q8 engine, II=4, whole weight streamed each token, 150MHz; no architectural rewrite or caching',
+            'limitations':'source-deduced throughput floors; M2 throughput and recurrence latency are author-reported; not independent FPGA clocks, power, AXI counters, actual PPA or innovative circuit'
+          }
+          assert residual_ms>=0
+          assert payload>nominal_raw_onchip*5
+          assert 0.75<output['stream_fraction_of_author_time']<0.85
+          assert output['conditional_all_recurrence_removed_speedup_cap']<1.02
+          Path('B197_R8_logs/R8_derived_bound.json').write_text(json.dumps(output,indent=2))
+          print('B197_R8_HARD_GDN_BUDGET_GATE_PASS',json.dumps({
+              k:output[k] for k in ['weight_words_per_token','serialized_Q8_engine_stream_time_ms_min','stream_fraction_of_author_time','conditional_all_nonstream_removed_speedup_cap','recurrence_64_heads_latency_ms_if_serial','conditional_all_recurrence_removed_speedup_cap','weight_capacity_to_raw_onchip_ratio']}))
+          PY
+          sha256sum B197_R8_logs/*.json B197_R8_logs/original_compiled_constants.log > B197_R8_logs/outputs_sha256.txt
+      - name: Upload independent executable bound receipts; no upstream source/checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R8-GDN-source-conditional-roofline
+          path: |
+            B197_R8_logs/
+            b197/r8_original_config_account.cpp
+          retention-days: 8
+          if-no-files-found: warn
