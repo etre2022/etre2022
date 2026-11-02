@@ -1,0 +1,107 @@
+name: B197-public-iCE40-RTL-SYNTH-PNR
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_public_ice40_pnr.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  physical-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Source, simulator, synthesis and routed timing (public example only)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p raw_logs/out reference_rtl
+          exec > >(tee -a raw_logs/B197_CI_full_stdout_stderr.log) 2>&1
+          echo "B197_SCOPE=PUBLIC_BLINKY_ONLY_NOT_SSM_OR_TCAS_PPA"
+          date -u -Is
+          uname -a
+          cat /etc/os-release
+          echo "GITHUB_SHA=$GITHUB_SHA GITHUB_REF=$GITHUB_REF RUNNER_OS=$RUNNER_OS"
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iverilog yosys nextpnr-ice40 fpga-icestorm
+          for cmd in iverilog vvp yosys nextpnr-ice40 icepack; do command -v "$cmd"; done
+          iverilog -V 2>&1 | head -15
+          yosys -V
+          nextpnr-ice40 --version
+          dpkg-query -W iverilog yosys nextpnr-ice40 nextpnr-ice40-chipdb fpga-icestorm >raw_logs/B197_dpkg_versions.txt
+          COMMIT=a2c6479977d64d312686d853a93941744fdbeacf
+          ROOT=https://raw.githubusercontent.com/YosysHQ/nextpnr/$COMMIT/ice40/examples/blinky
+          curl -fLsS --retry 3 "$ROOT/blinky.v" -o reference_rtl/blinky.v
+          curl -fLsS --retry 3 "$ROOT/blinky.pcf" -o reference_rtl/blinky.pcf
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          expected={'blinky.v':'36eaee860d5b69e6812169abaab169589b58ad29','blinky.pcf':'141dfcc85d1ba8f78259d0924e833b90ff74734e'}
+          for name,sha in expected.items():
+              data=(Path('reference_rtl')/name).read_bytes()
+              blob=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\x00'+data).hexdigest()
+              print('UPSTREAM_BLOB',name,blob,hashlib.sha256(data).hexdigest())
+              assert blob==sha,(name,blob,sha)
+          print('B197_UPSTREAM_CHECK_PASS')
+          PY
+          cat > reference_rtl/tb_blinky.sv <<'SV'
+          module SB_GB(input wire USER_SIGNAL_TO_GLOBAL_BUFFER,output wire GLOBAL_BUFFER_OUTPUT);
+            assign GLOBAL_BUFFER_OUTPUT=USER_SIGNAL_TO_GLOBAL_BUFFER;
+          endmodule
+          module tb_blinky;
+            reg clki=0;
+            wire led1,led2,led3,led4,led5;
+            reg [25:0] prev_counter, expected_counter;
+            reg [4:0] expected_outcnt,expected_led;
+            integer i;
+            blinky dut(.clki(clki),.led1(led1),.led2(led2),.led3(led3),.led4(led4),.led5(led5));
+            always #5 clki=~clki;
+            initial begin
+              @(negedge clki);
+              dut.counter=(1 << 21)-5;
+              for(i=0;i<16;i=i+1) begin
+                prev_counter=dut.counter;
+                @(posedge clki); #1;
+                expected_counter=prev_counter+1'b1;
+                expected_outcnt=prev_counter >> 21;
+                expected_led=expected_outcnt^(expected_outcnt >> 1);
+                if(dut.counter !== expected_counter) $fatal(1,"COUNTER_FAIL cycle=%0d",i);
+                if({led1,led2,led3,led4,led5} !== expected_led) $fatal(1,"LED_FAIL cycle=%0d",i);
+              end
+              $display("B197_SIM_PASS cycles=16 rollover=yes"); $finish;
+            end
+          endmodule
+          SV
+          sha256sum reference_rtl/* > raw_logs/B197_source_sha256.txt
+          iverilog -g2012 -s tb_blinky -o raw_logs/out/sim.vvp reference_rtl/blinky.v reference_rtl/tb_blinky.sv
+          vvp raw_logs/out/sim.vvp | tee raw_logs/B197_vvp.log
+          grep -q '^B197_SIM_PASS' raw_logs/B197_vvp.log
+          yosys -Q -T -l raw_logs/B197_yosys.log -p 'read_verilog reference_rtl/blinky.v; synth_ice40 -top blinky -json raw_logs/out/blinky.json; stat'
+          nextpnr-ice40 --hx1k --package tq144 --json raw_logs/out/blinky.json --pcf reference_rtl/blinky.pcf --asc raw_logs/out/blinky.asc --freq 25 --seed 1 --report raw_logs/B197_nextpnr_report.json --detailed-timing-report 2>&1 | tee raw_logs/B197_nextpnr.log
+          icepack raw_logs/out/blinky.asc raw_logs/out/blinky.bin
+          python3 - <<'PY'
+          import json,hashlib
+          from pathlib import Path
+          p=Path('raw_logs/B197_nextpnr_report.json')
+          r=json.loads(p.read_text())
+          f=r.get('fmax',{})
+          u=r.get('utilization',{})
+          assert f and any(float(x.get('achieved',0))>0 for x in f.values()),('MISSING_ROUTED_FMAX',f)
+          assert u and any(int(x.get('used',0))>0 for x in u.values()),('MISSING_UTILIZATION',u)
+          assert Path('raw_logs/out/blinky.bin').stat().st_size>0
+          assert Path('raw_logs/B197_nextpnr.log').stat().st_size>0
+          result={'scope':'TOOLCHAIN_SMOKE_ONLY','status':'SMOKE_SIM_SYNTH_PNR_TIMING_PASS','target':'iCE40 HX1K TQ144','clock_constraint_MHz':25,'seed':1,'fmax':f,'utilization':u}
+          Path('raw_logs/B197_CI_summary.json').write_text(json.dumps(result,indent=2))
+          print('B197_PHYSICAL_SMOKE_PASS',json.dumps(result))
+          PY
+          date -u -Is
+      - name: Preserve logs and failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-public-ice40-physical-logs
+          path: |
+            raw_logs/
+            reference_rtl/
+          if-no-files-found: warn
+          retention-days: 5
