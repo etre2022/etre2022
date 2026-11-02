@@ -73,11 +73,11 @@ jobs:
               assert m is not None,(v,l[-600:])
               assert int(m.group(2))==10 and int(m.group(3))==64,(v,m.groups())
               def nums(label):
-                  match=re.search(label+r' max / mean / rmse:\s+([0-9.eE+-]+) / ([0-9.eE+-]+) / ([0-9.eE+-]+)',l)
+                  match=re.search(r'^\s*'+re.escape(label)+r'\s+max / mean / rmse:\s+([0-9.eE+-]+) / ([0-9.eE+-]+) / ([0-9.eE+-]+)',l,re.M)
                   assert match is not None,(v,label)
                   return [float(s) for s in match.groups()]
               state=nums('state_out')
-              out=nums('out       ')
+              out=nums('out')
               assert state[0]<1e-4 and out[0]<1e-4
               assert len(re.findall(r'  Seq \d+ Step \d+ \| out max err:',l))==640
               results[v]={'independent_640_step_native_cpp_PASS':True,'state_max_mean_rmse':state,'out_max_mean_rmse':out,'checked_outputs':10*64*256,'checked_final_states':10*8192}
