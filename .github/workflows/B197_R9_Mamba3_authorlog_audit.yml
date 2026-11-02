@@ -1,0 +1,50 @@
+name: B197 R9 audit six Mamba3 board receipts and HLS reports
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R9_Mamba3_authorlog_audit.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  independent-log-parser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin exact source then recompute 6x10 third-party reported board latencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p B197_R9_logs
+          exec > >(tee B197_R9_logs/audit_job.log) 2>&1
+          trap 'rc=$?; echo "B197_R9_AUTHOR_AUDIT_EXIT=$rc"; date -u -Is' EXIT
+          echo 'SCOPE=SOURCE_DERIVED_3RD_PARTY_LOG_RECOMPUTATION_NOT_INDEPENDENT_HARDWARE_PPA'
+          date -u -Is
+          git clone --filter=blob:none --no-checkout https://github.com/rohitmandapati/mamba3-hls.git upstream
+          git -C upstream checkout --detach a380d1b8ccc503fe42459056d3627201d101927d
+          test "$(git -C upstream rev-parse HEAD)" = a380d1b8ccc503fe42459056d3627201d101927d
+          sha256sum upstream/src/hls/model_config.h upstream/README.md upstream/important_results/syn/syn_baseline.rpt upstream/important_results/fpga/fpga_baseline.txt b197/r9_author_log_audit.py > B197_R9_logs/input_sha256.txt
+          python3 b197/r9_author_log_audit.py
+          test -s B197_R9_logs/K26_6config_summary.csv
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          a=json.loads(Path('B197_R9_logs/K26_report_audit.json').read_text())
+          assert len(a['rows'])==6
+          assert a['model_contract']['host_logical_payload_bytes']==532512
+          assert a['baseline_effective_us_per_32bit_word']>0
+          assert a['no_independent_k26_implementation'] and a['no_new_architecture']
+          print("B197_R9_REPORT_ACCOUNTING_PASS",a['model_contract'])
+          PY
+          sha256sum B197_R9_logs/*.csv B197_R9_logs/*.json > B197_R9_logs/output_sha256.txt
+      - name: Preserve only own parser and derived results; never upstream source/bitstream
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R9-Mamba3-K26-source-derived-audit
+          path: |
+            B197_R9_logs/
+            b197/r9_author_log_audit.py
+          retention-days: 7
+          if-no-files-found: warn
