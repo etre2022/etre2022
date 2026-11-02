@@ -1,0 +1,119 @@
+name: B197-upstream-S4D-ECP5-PNR
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_upstream_s4d_ecp5.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  upstream-s4d-physical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 19
+    steps:
+      - name: Upstream S4D original RTL - simulation, synthesis, routed timing
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p raw_logs/out upstream
+          exec > >(tee raw_logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_RUN_EXIT_CODE=$rc"; date -u -Is' EXIT
+          echo "B197_SCOPE=UNMODIFIED_UPSTREAM_S4D_BIQUAD_NOT_MAMBA3_NOT_GDN_NOT_TCASSII_PPA"
+          date -u -Is
+          uname -a
+          cat /etc/os-release
+          echo "workflow_sha=$GITHUB_SHA run_id=$GITHUB_RUN_ID"
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iverilog yosys nextpnr-ecp5 nextpnr-ecp5-chipdb
+          { dpkg-query -W iverilog yosys nextpnr-ecp5 nextpnr-ecp5-chipdb; yosys -V; nextpnr-ecp5 --version; iverilog -V 2>&1 | head -5; } > raw_logs/tool_versions.txt
+          cat raw_logs/tool_versions.txt
+          git clone --filter=blob:none --no-checkout https://github.com/D1nDo/S4_Silicon_ZCU104.git upstream/s4d
+          git -C upstream/s4d checkout --detach bf6c7f0344349803a2ff197a23bbac9dab6669dd
+          test "$(git -C upstream/s4d rev-parse HEAD)" = "bf6c7f0344349803a2ff197a23bbac9dab6669dd"
+          cp upstream/s4d/new/s4d_biquad_unit.v raw_logs/upstream_original_s4d_biquad_unit.v
+          cp upstream/s4d/LICENSE raw_logs/upstream_LICENSE
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p=Path('raw_logs/upstream_original_s4d_biquad_unit.v')
+          b=p.read_bytes()
+          sha=hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()
+          print('UPSTREAM_GIT_BLOB_SHA',sha)
+          assert sha=='56d109a83c2a0a29baed44a02c3e669a4d8ee708',sha
+          print('B197_SOURCE_INTEGRITY_PASS')
+          PY
+          sha256sum raw_logs/upstream_original_s4d_biquad_unit.v raw_logs/upstream_LICENSE > raw_logs/source_sha256.txt
+          cat >raw_logs/tb_s4d_zero.v <<'V'
+          module tb_s4d_zero;
+            reg clk=0, rst_n=0, cfg_we=0,cfgd_we=0,start=0,clr=0;
+            reg [6:0] cfg_addr=0;
+            reg [79:0] cfg_data=0;
+            reg [1:0] cfgd_addr=0;
+            reg signed [15:0] cfgd_data=0;
+            reg [4:0] cfgd_bsh=7;
+            reg [63:0] u_vec=0;
+            wire busy,out_valid,ovf;
+            wire signed [39:0] out_acc;
+            integer idx, cycles, nout;
+            s4d_biquad_unit #(.NCH(4),.MODES(32),.LOG2_NB(7),.LOG2_MOD(5),.LOG2_CH(2))
+            dut(.clk(clk),.rst_n(rst_n),.cfg_we(cfg_we),.cfg_addr(cfg_addr),
+              .cfg_data(cfg_data),.cfgd_we(cfgd_we),.cfgd_addr(cfgd_addr),
+              .cfgd_data(cfgd_data),.cfgd_bsh(cfgd_bsh),.start(start),.clr(clr),
+              .u_vec(u_vec),.busy(busy),.out_valid(out_valid),.out_acc(out_acc),.ovf(ovf));
+            always #5 clk=~clk;
+            initial begin
+              repeat(4) @(negedge clk); rst_n=1;
+              for(idx=0;idx<128;idx=idx+1) begin
+                @(negedge clk); cfg_we=1; cfg_addr=idx; cfg_data=0;
+              end
+              @(negedge clk); cfg_we=0;
+              for(idx=0;idx<4;idx=idx+1) begin
+                @(negedge clk); cfgd_we=1; cfgd_addr=idx; cfgd_data=0; cfgd_bsh=7;
+              end
+              @(negedge clk); cfgd_we=0; clr=1; start=1;
+              @(negedge clk); start=0; clr=0;
+              nout=0;
+              for(cycles=0;cycles<200;cycles=cycles+1) begin
+                @(negedge clk);
+                if(out_valid) begin
+                  if(out_acc !== 40'sd0) $fatal(1,"OUT_ACC_NONZERO");
+                  nout=nout+1;
+                end
+                if(ovf !== 1'b0) $fatal(1,"UNEXPECTED_SATURATION");
+              end
+              if(nout!=4) $fatal(1,"WRONG_OUTPUT_COUNT got %0d expected 4",nout);
+              $display("B197_S4D_ZERO_SMOKE_PASS outputs=%0d",nout);
+              $finish;
+            end
+          endmodule
+          V
+          iverilog -g2012 -s tb_s4d_zero -o raw_logs/out/s4d_zero.vvp raw_logs/upstream_original_s4d_biquad_unit.v raw_logs/tb_s4d_zero.v
+          vvp raw_logs/out/s4d_zero.vvp 2>&1 | tee raw_logs/sim.log
+          grep -q 'B197_S4D_ZERO_SMOKE_PASS' raw_logs/sim.log
+          echo B197_SYNTH_START
+          timeout 360s yosys -Q -T -l raw_logs/yosys.log -p 'read_verilog -sv raw_logs/upstream_original_s4d_biquad_unit.v; hierarchy -top s4d_biquad_unit -chparam NCH 4 -chparam MODES 32 -chparam LOG2_NB 7 -chparam LOG2_MOD 5 -chparam LOG2_CH 2; synth_ecp5 -top s4d_biquad_unit -json raw_logs/out/s4d_unit.json; stat'
+          echo B197_SYNTH_PASS
+          timeout 540s nextpnr-ecp5 --85k --package CABGA756 --speed 6 --json raw_logs/out/s4d_unit.json --textcfg raw_logs/out/s4d_unit.config --freq 25 --seed 1 --report raw_logs/nextpnr_report.json --detailed-timing-report 2>&1 | tee raw_logs/nextpnr.log
+          echo B197_PNR_PROCESS_SUCCESS
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('raw_logs/nextpnr_report.json')
+          assert p.exists(),'no nextpnr report'
+          d=json.loads(p.read_text());f=d.get('fmax',{});u=d.get('utilization',{})
+          assert f and any(float(x.get('achieved',0))>0 for x in f.values()),f
+          assert u and any(float(x.get('used',0))>0 for x in u.values()),u
+          assert Path('raw_logs/out/s4d_unit.config').stat().st_size>0
+          out={'scope':'UPSTREAM_S4D_UNIT_PNR_MICROBENCH_NOT_MAMBA3_NOT_GDN','source_commit':'bf6c7f0344349803a2ff197a23bbac9dab6669dd','target':'Lattice LFE5U-85F CABGA756 speed-6','freq_constraint_mhz':25,'seed':1,'fmax_mhz':f,'utilization':u,'top':'s4d_biquad_unit','parameters':{'NCH':4,'MODES':32,'LOG2_NB':7,'LOG2_MOD':5,'LOG2_CH':2},'note':'No board testing, no IO constraints, no full model, no power'}
+          Path('raw_logs/B197_s4d_physical_summary.json').write_text(json.dumps(out,indent=2))
+          print('B197_UPSTREAM_S4D_PNR_PASS',json.dumps(out))
+          PY
+          date -u -Is
+      - name: Upload all original logs even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-upstream-S4D-EDA-receipt
+          path: raw_logs/
+          retention-days: 5
+          if-no-files-found: warn
