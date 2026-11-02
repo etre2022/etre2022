@@ -1,0 +1,83 @@
+name: B197 R8 execute original GDN native weight-read counters
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R8_GDN_Actual_Native_Reads.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-read-count:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count logical q8 and embedding reads over 4 actual native model forwards
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p build B197_R8_logs
+          exec > >(tee B197_R8_logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_R8_READ_CI_EXIT=$rc"; date -u -Is' EXIT
+          date -u -Is
+          echo 'SCOPE=NATIVE_GDN_SOURCE_LOGICAL_COUNTS_NOT_HLS_OR_KV260_BUS_COUNTERS'
+          g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          sha256sum upstream/src/config.hpp upstream/src/decode.cpp upstream/src/weight.cpp b197/native_only_compat/ap_int.h b197/r8_native_read_count.py b197/r8_native_read_driver.cpp > B197_R8_logs/input_sha256.txt
+          python3 - <<'PY'
+          import hashlib,struct
+          from pathlib import Path
+          b=bytearray(Path('upstream/model/tinystories15M_q8.bin').read_bytes())
+          assert hashlib.sha256(b).hexdigest()=='63fe5c9bca6bbf7abfd05ab5c67e9fb58d8ba25d4184a65d22e04c9179e78b64'
+          assert struct.unpack_from('<i',b,40)[0]==256
+          struct.pack_into('<i',b,40,1024)
+          assert hashlib.sha256(b).hexdigest()=='7dbe38e0115c94cdeff3f4acb7127a74efddd8843c7915c287a928d57ba497f0'
+          Path('/tmp/B197_R8_meta.bin').write_bytes(b)
+          print('B197_R8_ONE_BYTE_META_PASS')
+          PY
+          python3 b197/r8_native_read_count.py
+          FLAGS="-O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas -Ib197/native_only_compat -Iupstream/src"
+          g++ $FLAGS -DBUILD_DECODE_KERNEL -c build/instrumented_decode.cpp -o build/kernel.o
+          g++ $FLAGS -c upstream/src/weight.cpp -o build/weight.o
+          g++ $FLAGS -DUSE_CPU_ONLY -c b197/r8_native_read_driver.cpp -o build/driver.o
+          g++ build/kernel.o build/weight.o build/driver.o -lm -o build/exe
+          timeout 120s build/exe /tmp/B197_R8_meta.bin > B197_R8_logs/logical_counts.log 2>&1
+          cat B197_R8_logs/logical_counts.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json,hashlib
+          t=Path('B197_R8_logs/logical_counts.log').read_text()
+          matches=re.findall(r'B197_ACTUAL_NATIVE_WEIGHT_CALLS token=(\d+) q8_words=(\d+) embed_words=(\d+) q8_calls=(\d+) recurrence_calls=(\d+)',t)
+          print('B197_R8_COUNT_ROWS',matches)
+          assert len(matches)==4,('expected 4 logical decode calls',matches)
+          rows=[]
+          for token,q,e,c,r in matches:
+              q,e,c,r=map(int,[q,e,c,r])
+              assert q==273024 and e==16 and c==89 and r==64,(token,q,e,c,r)
+              rows.append({'token':int(token),'q8_words':q,'embedding_words':e,'shared_q8_calls':c,'recurrent_head_calls':r,
+                  'logical_128bit_source_reads':4*(q+e),'logical_weight_bytes':64*(q+e)})
+          assert len(set(x['logical_weight_bytes'] for x in rows))==1
+          result={'source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d',
+                  'kind':'NATIVE_LOGICAL_PARAMETER_LOAD_COUNTER_NOT_AXIBUS_NOT_HLS',
+                  'native_runs':len(rows),'rows':rows,
+                  'per_token_packed_engine_512b_words':273024,'per_token_extra_embedding_512b_words':16,
+                  'per_token_byte_reads_in_source':17474560,
+                  'not_physical_PPA':True,
+                  'no_resulting_architecture':True}
+          Path('B197_R8_logs/native_read_counts.json').write_text(json.dumps(result,indent=2))
+          print('B197_R8_NATIVE_LOGICAL_READ_GATE_PASS',json.dumps({'tokens':len(rows),'q8_words':273024,'embedding_words':16,'q8_calls':89,'recurrent_calls':64,'bytes':17474560}))
+          PY
+          sha256sum B197_R8_logs/native_read_counts.json B197_R8_logs/logical_counts.log >B197_R8_logs/result_sha256.txt
+      - name: Upload native read counter receipts only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R8-GDN-native-read-count-receipts
+          path: |
+            B197_R8_logs/
+            b197/r8_native_read_count.py
+            b197/r8_native_read_driver.cpp
+          retention-days: 8
+          if-no-files-found: warn
