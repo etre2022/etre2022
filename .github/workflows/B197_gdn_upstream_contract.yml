@@ -1,0 +1,92 @@
+name: B197 GDN upstream CPU contract and HLS environment gate
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_upstream_contract.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Pin original GDN-HLS, verify published checkpoint, run original native CPU reference
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p B197_logs
+          exec > >(tee B197_logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_GDN_RUN_EXIT_CODE=$rc"; date -u -Is' EXIT
+          echo "B197_SCOPE=UPSTREAM_GDN_CPU_REFERENCE_ONLY_NO_FPGA_PPA_NO_HLS_SYNTHESIS"
+          date -u -Is; uname -a; cat /etc/os-release
+          echo "GH_RUN_ID=$GITHUB_RUN_ID GH_SHA=$GITHUB_SHA"
+          command -v g++ ; command -v cmake
+          g++ --version | head -1; cmake --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = "45a7e14315d78e2c38b93e740cb0e4fb3f032c4d"
+          { echo "GIT_HEAD=$(git -C upstream rev-parse HEAD)"; git -C upstream status --porcelain; git -C upstream ls-files model; git -C upstream ls-files | grep -E '(^LICENSE|^COPYING|^NOTICE|^README|^src/(config|decode|weight|main))' || true; } | tee B197_logs/provenance.txt
+          sha256sum upstream/src/config.hpp upstream/src/decode.cpp upstream/src/decode.hpp upstream/src/main.cpp upstream/src/weight.cpp upstream/model/*.bin | tee B197_logs/sha256.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct,json
+          model=Path('upstream/model')
+          fn='climbmix15M_demo_q8.bin'
+          present=(model/fn).exists()
+          candidates=sorted((p.name,p.stat().st_size) for p in model.glob('*.bin'))
+          p=model/'tinystories15M_q8.bin'
+          hd=p.read_bytes()[:256] if p.exists() else b''
+          m=dict(expected_readme_filename=fn,expected_readme_exists=present,candidates=candidates,first16_hex=hd[:16].hex(),checkpoint_magic_le=hex(struct.unpack_from('<I',hd,0)[0]) if len(hd)>=4 else None,checkpoint_version_le=struct.unpack_from('<i',hd,4)[0] if len(hd)>=8 else None,expected_magic='0x47444e65',expected_version=2)
+          Path('B197_logs/checkpoint_inspection.json').write_text(json.dumps(m,indent=2))
+          print('B197_CHECKPOINT_DISCOVERY',json.dumps(m))
+          PY
+          cmake -S upstream -B upstream/outputs/cpu -DCMAKE_BUILD_TYPE=Release 2>&1 | tee B197_logs/cmake_config.log
+          cmake --build upstream/outputs/cpu -j2 2>&1 | tee B197_logs/cmake_build.log
+          echo "B197_GDN_CPU_BUILD_PASS"
+          cd upstream
+          # Author README command uses a filename not present in this git tree. Preserve failure separately.
+          set +e
+          timeout 25s ./outputs/cpu/gdn_host --max_seq 1 --temp 0 -i "Once" > ../B197_logs/readme_default_path_test.log 2>&1
+          BAD_RC=$?
+          set -e
+          echo "B197_README_DEFAULT_EXIT=$BAD_RC"
+          sed -n '1,25p' ../B197_logs/readme_default_path_test.log
+          echo "B197_CPU_CORRECTED_PATH_TEST_START"
+          set +e
+          timeout 120s ./outputs/cpu/gdn_host --weight_path model/tinystories15M_q8.bin --vocab_path model/tokenizer.bin --max_seq 16 --temp 0 -i "Once" > ../B197_logs/cpu_run_16.log 2>&1
+          CPU_RC=$?
+          set -e
+          echo "B197_CPU_CORRECTED_PATH_EXIT=$CPU_RC"
+          tail -35 ../B197_logs/cpu_run_16.log
+          cd ..
+          {
+            echo 'VITIS_VPP_AVAILABLE:'; command -v v++ || echo NO
+            echo 'VITIS_HLS_AVAILABLE:'; command -v vitis_hls || echo NO
+            echo 'VITIS_AP_INT_HEADER_AVAILABLE:'; test -f /opt/xilinx/2025.2/Vitis/include/ap_int.h && echo YES || echo NO
+            echo 'FPGA_DEVICE_AVAILABLE:'; ls /dev/xclmgmt* /dev/dri/renderD* 2>&1 || true
+          } | tee B197_logs/hls_physical_gate.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          logs=Path('B197_logs')
+          cpu=(logs/'cpu_run_16.log').read_text(errors='replace')
+          cfg=(logs/'checkpoint_inspection.json').read_text()
+          status={'scope':'UPSTREAM_CPU_REFERENCE_ONLY_NOT_HLS_OR_FPGA_PPA',
+                  'upstream_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d',
+                  'published_default_checkpoint_is_missing':not json.loads(cfg)['expected_readme_exists'],
+                  'cpu_generated_token_log_present': 'Speed:' in cpu,
+                  'native_kernel_simulated':False,'physical_PPA_measured':False}
+          (logs/'B197_GDN_CI_summary.json').write_text(json.dumps(status,indent=2))
+          print('B197_GDN_CI_SUMMARY',json.dumps(status))
+          PY
+          # Preserve failure statuses as evidence even when the original checkpoint is incompatible.
+          if [ "$CPU_RC" -ne 0 ]; then echo "B197_GDN_CPU_REFERENCE_BLOCKED exit_code=$CPU_RC"; fi
+      - name: Archive logs only (no model weights or external source redistribution)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-public-reference-CPU-audit
+          path: B197_logs/
+          retention-days: 7
+          if-no-files-found: warn
