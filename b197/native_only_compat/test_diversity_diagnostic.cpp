@@ -19,7 +19,8 @@ static std::vector<ap_uint<128>> beats(const std::vector<std::uint8_t>& b){
 int main(int argc,char**argv){
   if(argc!=2)return 2;
   gdn::Weights w;gdn::LoadWeights(w,argv[1]);
-  auto b=beats(gdn::PackParameters(w)),s=gdn::BuildFp32Side(w);
+  auto b=beats(gdn::PackParameters(w));
+  auto s=gdn::BuildFp32Side(w);
   std::array<int,4> lens{{64,64,64,256}};
   std::vector<int> first_native,first_cpu;
   int total=0,mismatches=0,replayed_diff_native=-1,replayed_diff_cpu=-1;
