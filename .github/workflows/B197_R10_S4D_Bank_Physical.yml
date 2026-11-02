@@ -1,0 +1,123 @@
+name: B197 R10 licensed S4D biquad-bank ECP5 physical scaling
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R10_S4D_Bank_Physical.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ecp5-bank:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {units: 2, h: 8, logh: 3, logu: 1, mapping: default}
+          - {units: 4, h: 16, logh: 4, logu: 2, mapping: default}
+          - {units: 8, h: 32, logh: 5, logu: 3, mapping: default}
+          - {units: 8, h: 32, logh: 5, logu: 3, mapping: nowidelut}
+          - {units: 8, h: 32, logh: 5, logu: 3, mapping: abc9}
+    env:
+      UNITS: ${{ matrix.units }}
+      H: ${{ matrix.h }}
+      LOGH: ${{ matrix.logh }}
+      LOGU: ${{ matrix.logu }}
+      MAPPING: ${{ matrix.mapping }}
+    steps:
+      - name: Original MIT RTL elaborate synthesize and 2-seed PNR
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p B197_R10_logs/out original
+          exec > >(tee B197_R10_logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_R10_JOB_EXIT=$rc units=$UNITS mapping=$MAPPING"; date -u -Is' EXIT
+          echo 'B197_SCOPE=LICENSED_S4D_BANK_ECP5_PNR_NOT_MAMBA3_NOT_KV260'
+          date -u -Is
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iverilog yosys nextpnr-ecp5 nextpnr-ecp5-chipdb
+          { dpkg-query -W iverilog yosys nextpnr-ecp5 nextpnr-ecp5-chipdb; yosys -V; nextpnr-ecp5 --version; } >B197_R10_logs/tool_versions.txt
+          git clone --filter=blob:none --no-checkout https://github.com/D1nDo/S4_Silicon_ZCU104.git original/s4d
+          git -C original/s4d checkout --detach bf6c7f0344349803a2ff197a23bbac9dab6669dd
+          test "$(git -C original/s4d rev-parse HEAD)" = bf6c7f0344349803a2ff197a23bbac9dab6669dd
+          cp original/s4d/LICENSE B197_R10_logs/upstream_MIT_LICENSE
+          sha256sum original/s4d/new/s4d_biquad_unit.v original/s4d/new/s4d_biquad_bank.v original/s4d/LICENSE >B197_R10_logs/upstream_sha256.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          expected={'s4d_biquad_unit.v':'56d109a83c2a0a29baed44a02c3e669a4d8ee708','s4d_biquad_bank.v':'6e5e2315719d3380ed8e7f4b8d6d4561b0e64520'}
+          for name,expected_sha in expected.items():
+              d=Path('original/s4d/new',name).read_bytes()
+              sha=hashlib.sha1(b'blob '+str(len(d)).encode()+b'\0'+d).hexdigest()
+              assert sha==expected_sha,(name,sha,expected_sha)
+              print('B197_R10_GIT_BLOB_SHA',name,sha)
+          assert 'MIT License' in Path('original/s4d/LICENSE').read_text()
+          print('B197_R10_PINNED_MIT_RTL_VERIFIED')
+          PY
+          SRC="original/s4d/new/s4d_biquad_bank.v original/s4d/new/s4d_biquad_unit.v"
+          iverilog -g2012 -s s4d_biquad_bank -o B197_R10_logs/out/elaboration.vvp $SRC
+          echo B197_R10_IVERILOG_ELABORATION_PASS
+          OPT=""
+          case "$MAPPING" in default) OPT="";; nowidelut) OPT="-nowidelut";; abc9) OPT="-abc9";; *) exit 12;; esac
+          CMD="read_verilog -sv $SRC; hierarchy -top s4d_biquad_bank -chparam H $H -chparam LOG2_H $LOGH -chparam NUNITS $UNITS -chparam LOG2_NU $LOGU -chparam NCH 4 -chparam LOG2_NCH 2 -chparam MODES 32 -chparam LOG2_MOD 5 -chparam LOG2_NB 7; synth_ecp5 -top s4d_biquad_bank $OPT -json B197_R10_logs/out/netlist.json; stat"
+          echo "$CMD" >B197_R10_logs/yosys_command.txt
+          timeout 420s yosys -Q -T -l B197_R10_logs/yosys.log -p "$CMD"
+          test -s B197_R10_logs/out/netlist.json
+          sha256sum B197_R10_logs/out/netlist.json >B197_R10_logs/netlist_sha256.txt
+          echo B197_R10_ECP5_SYNTHESIS_PASS
+          for SEED in 1 2; do
+            echo "B197_R10_SEED_START=$SEED"
+            timeout 420s nextpnr-ecp5 --85k --package CABGA756 --speed 6 \
+              --json B197_R10_logs/out/netlist.json \
+              --textcfg "B197_R10_logs/out/route_seed$SEED.config" \
+              --freq 100 --timing-allow-fail --seed "$SEED" \
+              --report "B197_R10_logs/route_seed$SEED.json" \
+              --detailed-timing-report > "B197_R10_logs/route_seed$SEED.log" 2>&1 || { echo "B197_R10_PNR_FAILURE seed=$SEED"; tail -85 "B197_R10_logs/route_seed$SEED.log"; exit 35; }
+            test -s "B197_R10_logs/out/route_seed$SEED.config"
+            echo "B197_R10_SEED_DONE=$SEED"
+            tail -32 "B197_R10_logs/route_seed$SEED.log"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,json,hashlib,statistics,re
+          rows=[]
+          for seed in [1,2]:
+              obj=json.loads(Path(f'B197_R10_logs/route_seed{seed}.json').read_text())
+              fmax=obj.get('fmax',{})
+              util=obj.get('utilization',{})
+              assert fmax and util,('missing PNR timing/resources',obj.keys())
+              f=next(iter(fmax.values()))
+              assert f['achieved']>0
+              used={k:int(v['used']) for k,v in util.items() if int(v.get('used',0))>0}
+              log=Path(f'B197_R10_logs/route_seed{seed}.log').read_text(errors='replace')
+              m=re.search(r'Critical path report for clock[^:]*:([\s\S]*?)(?:Slack histogram:|Critical path report for cross-domain)',log)
+              section=m.group(1) if m else ''
+              srcs=re.findall(r'Source\s+([^\s]+)',section)
+              dsts=re.findall(r'Sink\s+([^\s]+)',section)
+              rows.append({'seed':seed,'fmax_mhz':float(f['achieved']),'meets_100mhz':f['achieved']>=100,
+                   'used':used,'critical_first_src':srcs[0] if srcs else 'UNPARSED',
+                   'critical_last_dst':dsts[-1] if dsts else 'UNPARSED'})
+          result={'scope':'LICENSED_S4D_BANK_ECP5_PNR_NOT_MAMBA3_OR_KV260',
+              'upstream_commit':'bf6c7f0344349803a2ff197a23bbac9dab6669dd',
+              'licensed_MIT':True,'device':'LFE5U-85F CABGA756 speed grade 6',
+              'top':'s4d_biquad_bank','H':int(os.environ['H']),
+              'NUNITS':int(os.environ['UNITS']),'NCH':4,'MODES':32,
+              'mapping':os.environ['MAPPING'],'clock_target_MHz':100,'seeds':rows,
+              'mean_fmax_mhz':statistics.mean(x['fmax_mhz'] for x in rows),
+              'netlist_sha256':hashlib.sha256(Path('B197_R10_logs/out/netlist.json').read_bytes()).hexdigest(),
+              'timing_allow_fail_100mhz':True,'no_board_power':True,
+              'not_full_S4D_inference':True,'no_new_architecture':True}
+          Path('B197_R10_logs/summary.json').write_text(json.dumps(result,indent=2))
+          print('B197_R10_S4D_ECP5_BANK_PHYSICAL_PASS',json.dumps({
+              'units':result['NUNITS'],'mapping':result['mapping'],
+              'fmax':[x['fmax_mhz'] for x in rows],'resources':rows[0]['used']}))
+          PY
+      - name: Archive raw synthesis, PNR and failure receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R10-S4D-bank-${{ matrix.units }}-${{ matrix.mapping }}
+          path: B197_R10_logs/
+          if-no-files-found: warn
+          retention-days: 7
