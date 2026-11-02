@@ -68,8 +68,8 @@ before('  const float q_scale = 1.0f / std::sqrt(static_cast<float>(kHeadKDim));
        '  b197_trace_f("C","embed",token,-1,s.x.data(),kDim);')
 after('    RmsNorm(s.xb.data(), s.x.data(), l.attn_norm.data(), kDim);',
       '    b197_trace_f("C","rms_att",token,layer,s.xb.data(),kDim);')
-after('    Quantize(s.xq_q.data(), s.xq_s.data(), s.xb.data(), kDim);',
-      '    b197_trace_q("C","q8_att",token,layer,s.xq_q.data(),kDim);')
+before('    Matmul(s.q.data(), s.xq_q.data(), s.xq_s.data(), l.q_proj);',
+       '    b197_trace_q("C","q8_att",token,layer,s.xq_q.data(),kDim);')
 before('    ConvStep(s.q.data(),',
        '    b197_trace_f("C","proj_q",token,layer,s.q.data(),32);b197_trace_f("C","proj_k",token,layer,s.k.data(),32);b197_trace_f("C","proj_v",token,layer,s.v.data(),32);')
 before('    for (int h = 0; h < kNumHeads; ++h) {\n      float* qh = s.q.data() + h * kHeadKDim;',
