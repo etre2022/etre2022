@@ -2,7 +2,7 @@ name: B197 R7 first divergence stage trace
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/B197_R7_first_divergence.yml']
+    paths: ['.github/workflows/B197_R7_first_divergence.yml', 'b197/r7_instrument.py', 'b197/r7_analyze.py', 'b197/r7_stage_driver.cpp']
   workflow_dispatch:
 permissions:
   contents: read
