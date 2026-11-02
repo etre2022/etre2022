@@ -1,0 +1,99 @@
+name: B197 GDN persistent-state native 128-token sweep
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_GDN_native_128step_state_sweep.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  kernel-vs-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Build upstream unmodified GDN kernel against Xilinx Apache-2.0 simulation-only AP library
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence objects
+          exec > >(tee evidence/full_job_stdout_stderr.log) 2>&1
+          trap 'rc=$?; echo "B197_GDN_NATIVE_AP_JOB_EXIT=$rc"; date -u -Is' EXIT
+          echo 'B197_SCOPE=128_TOKEN_REPEATED_16_INPUT_NATIVE_CPP_NOT_VITIS_NOT_FPGA_PPA'
+          date -u -Is; uname -a; cat /etc/os-release
+          g++ --version | head -1
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgmp-dev
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream_gdn
+          git -C upstream_gdn checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream_gdn rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          git clone --filter=blob:none --no-checkout https://github.com/Xilinx/HLS_arbitrary_Precision_Types.git apache_ap
+          git -C apache_ap checkout --detach 200a9aecaadf471592558540dc5a88256cbf880f
+          test "$(git -C apache_ap rev-parse HEAD)" = 200a9aecaadf471592558540dc5a88256cbf880f
+          test -f apache_ap/include/ap_int.h
+          test -f apache_ap/LICENSE.TXT
+          grep -q 'Apache License' apache_ap/LICENSE.TXT || grep -q 'Apache' apache_ap/README.MD
+          {
+            echo "UPSTREAM_GDN_COMMIT=$(git -C upstream_gdn rev-parse HEAD)"
+            echo "AP_SIM_COMMIT=$(git -C apache_ap rev-parse HEAD)"
+            echo "UPSTREAM_DECODE_GIT_BLOB=$(git -C upstream_gdn hash-object src/decode.cpp)"
+            echo "UPSTREAM_WEIGHT_GIT_BLOB=$(git -C upstream_gdn hash-object src/weight.cpp)"
+            echo "AP_HEADER_GIT_BLOB=$(git -C apache_ap hash-object include/ap_int.h)"
+            echo "UPSTREAM_GDN_LICENSE_FOUND=$(git -C upstream_gdn ls-files | grep -Ei '(^|/)(LICENSE|COPYING|NOTICE)(\.|$)' | wc -l)"
+          } | tee evidence/provenance.txt
+          sha256sum upstream_gdn/src/decode.cpp upstream_gdn/src/weight.cpp upstream_gdn/src/config.hpp apache_ap/include/ap_int.h upstream_gdn/model/tinystories15M_q8.bin > evidence/original_sha256.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,struct,json
+          p=Path('upstream_gdn/model/tinystories15M_q8.bin')
+          original=p.read_bytes()
+          assert struct.unpack_from('<I',original,0)[0]==0x47444e65
+          assert struct.unpack_from('<i',original,4)[0]==2
+          assert struct.unpack_from('<i',original,40)[0]==256
+          changed=bytearray(original)
+          struct.pack_into('<i',changed,40,1024)
+          changes=[i for i,(a,b) in enumerate(zip(original,changed)) if a!=b]
+          assert changes==[41],changes
+          Path('/tmp/B197_gdn_native_ap_header_shim.bin').write_bytes(changed)
+          out={'original_checkpoint_sha256':hashlib.sha256(original).hexdigest(),'metadata_compat_shim_sha256':hashlib.sha256(changed).hexdigest(),'changed_offsets':changes,'upstream_cpp_files_modified':False,'scope':'SINGLE_BYTE_CHECKPOINT_METADATA_SHIM_ONLY'}
+          Path('evidence/checkpoint_shim_provenance.json').write_text(json.dumps(out,indent=2))
+          print('B197_CHECKPOINT_META_ONLY',json.dumps(out))
+          PY
+          # Only change the harness build include path. Original upstream C++ is never edited.
+          FLAGS="-O2 -std=c++20 -Wall -Wextra -Wno-unknown-pragmas -ffp-contract=off -Iupstream_gdn/src -Iapache_ap/include"
+          echo "BUILD_FLAGS=$FLAGS" > evidence/build_flags.txt
+          echo BUILD_STAGE_KERNEL_START
+          timeout 360s g++ $FLAGS -DBUILD_DECODE_KERNEL -c upstream_gdn/src/decode.cpp -o objects/decode_kernel.o 2>&1 | tee evidence/compile_kernel.log
+          echo BUILD_STAGE_CPU_START
+          timeout 360s g++ $FLAGS -DUSE_CPU_ONLY -c upstream_gdn/src/decode.cpp -o objects/decode_cpu.o 2>&1 | tee evidence/compile_cpu.log
+          timeout 240s g++ $FLAGS -c upstream_gdn/src/weight.cpp -o objects/weight.o 2>&1 | tee evidence/compile_weight.log
+          timeout 240s g++ $FLAGS -DUSE_CPU_ONLY -c upstream_gdn/tools/kernel_sim.cpp -o objects/kernel_sim.o 2>&1 | tee evidence/compile_kernel_sim.log
+          timeout 120s g++ objects/decode_kernel.o objects/decode_cpu.o objects/weight.o objects/kernel_sim.o -lm -lgmp -o objects/kernel_sim 2>&1 | tee evidence/link.log
+          echo B197_UNMODIFIED_GDN_KERNEL_NATIVE_COMPILE_PASS
+          set +e
+          timeout 720s ./objects/kernel_sim /tmp/B197_gdn_native_ap_header_shim.bin 128 > evidence/kernel_vs_cpu_128_steps.log 2>&1
+          RC=$?
+          set -e
+          echo "B197_KERNEL_SIM_EXIT_CODE=$RC"
+          tail -40 evidence/kernel_vs_cpu_128_steps.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          text=Path('evidence/kernel_vs_cpu_128_steps.log').read_text(errors='replace')
+          steps=re.findall(r'^step\s+(\d+)\s+token\s+(\d+)\s+kernel\s+(\d+)\s+cpu\s+(\d+)\s+(ok|MISMATCH)\s*$',text,re.M)
+          result={'scope':'UNMODIFIED_GDN_HLS_CPP_NATIVE_WITH_XILINX_OPEN_SOURCE_AP_TYPES_NOT_VITIS_CSIM_NOT_FPGA','steps_detected':len(steps),'matched':sum(int(s[4]=='ok') for s in steps),'mismatched':sum(int(s[4]!='ok') for s in steps),'details':steps,'kernel_sim_stdout_tail':text[-1100:]}
+          Path('evidence/B197_native_kernel_sim_summary.json').write_text(json.dumps(result,indent=2))
+          print('B197_NATIVE_KERNEL_SIM_RESULTS',json.dumps({k:v for k,v in result.items() if k!='details' and k!='kernel_sim_stdout_tail'}))
+          PY
+          echo "VITIS_VPP=$(command -v v++ || echo not_installed)"
+          echo "VITIS_RTL_SIM=$(command -v xsim || echo not_installed)"
+          echo "B197_GDN_SIM_STATUS=$RC"
+          if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+          echo B197_GDN_NATIVE_KERNEL_128STEP_PASS
+      - name: Archive simulation logs and results, omit copyrighted source/model
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-native-AP-128-token-state-sweep
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: warn
