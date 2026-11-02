@@ -1,4 +1,4 @@
-name: B197-upstream-S4D-ECP5-PNR
+name: B197-upstream-S4D-ECP5-multiseed
 on:
   push:
     branches: [main]
@@ -51,7 +51,7 @@ jobs:
             reg [1:0] cfgd_addr=0;
             reg signed [15:0] cfgd_data=0;
             reg [4:0] cfgd_bsh=7;
-            reg [63:0] u_vec=0;
+            reg [63:0] u_vec=64'h0100010001000100;
             wire busy,out_valid,ovf;
             wire signed [39:0] out_acc;
             integer idx, cycles, nout;
@@ -64,7 +64,7 @@ jobs:
             initial begin
               repeat(4) @(negedge clk); rst_n=1;
               for(idx=0;idx<128;idx=idx+1) begin
-                @(negedge clk); cfg_we=1; cfg_addr=idx; cfg_data=0;
+                @(negedge clk); cfg_we=1; cfg_addr=idx; cfg_data=(idx%32==0)?(80'd128 << 48):80'd0;
               end
               @(negedge clk); cfg_we=0;
               for(idx=0;idx<4;idx=idx+1) begin
@@ -76,20 +76,20 @@ jobs:
               for(cycles=0;cycles<200;cycles=cycles+1) begin
                 @(negedge clk);
                 if(out_valid) begin
-                  if(out_acc !== 40'sd0) $fatal(1,"OUT_ACC_NONZERO");
+                  if(out_acc !== 40'sd256) $fatal(1,"OUT_ACC_EXPECTED_256 got=%0d",out_acc);
                   nout=nout+1;
                 end
                 if(ovf !== 1'b0) $fatal(1,"UNEXPECTED_SATURATION");
               end
               if(nout!=4) $fatal(1,"WRONG_OUTPUT_COUNT got %0d expected 4",nout);
-              $display("B197_S4D_ZERO_SMOKE_PASS outputs=%0d",nout);
+              $display("B197_S4D_NONZERO_SMOKE_PASS outputs=%0d",nout);
               $finish;
             end
           endmodule
           V
           iverilog -g2012 -s tb_s4d_zero -o raw_logs/out/s4d_zero.vvp raw_logs/upstream_original_s4d_biquad_unit.v raw_logs/tb_s4d_zero.v
           vvp raw_logs/out/s4d_zero.vvp 2>&1 | tee raw_logs/sim.log
-          grep -q 'B197_S4D_ZERO_SMOKE_PASS' raw_logs/sim.log
+          grep -q 'B197_S4D_NONZERO_SMOKE_PASS' raw_logs/sim.log
           echo B197_SYNTH_START
           timeout 360s yosys -Q -T -l raw_logs/yosys.log -p 'read_verilog -sv raw_logs/upstream_original_s4d_biquad_unit.v; hierarchy -top s4d_biquad_unit -chparam NCH 4 -chparam MODES 32 -chparam LOG2_NB 7 -chparam LOG2_MOD 5 -chparam LOG2_CH 2; synth_ecp5 -top s4d_biquad_unit -json raw_logs/out/s4d_unit.json; stat'
           echo B197_SYNTH_PASS
@@ -107,6 +107,31 @@ jobs:
           out={'scope':'UPSTREAM_S4D_UNIT_PNR_MICROBENCH_NOT_MAMBA3_NOT_GDN','source_commit':'bf6c7f0344349803a2ff197a23bbac9dab6669dd','target':'Lattice LFE5U-85F CABGA756 speed-6','freq_constraint_mhz':25,'seed':1,'fmax_mhz':f,'utilization':u,'top':'s4d_biquad_unit','parameters':{'NCH':4,'MODES':32,'LOG2_NB':7,'LOG2_MOD':5,'LOG2_CH':2},'note':'No board testing, no IO constraints, no full model, no power'}
           Path('raw_logs/B197_s4d_physical_summary.json').write_text(json.dumps(out,indent=2))
           print('B197_UPSTREAM_S4D_PNR_PASS',json.dumps(out))
+          PY
+          echo 'B197_MULTISEED_START same source/netlist/device/freq'
+          for SEED in 2 3 4; do
+            echo "B197_SEED_START=$SEED"
+            timeout 540s nextpnr-ecp5 --85k --package CABGA756 --speed 6 --json raw_logs/out/s4d_unit.json --textcfg "raw_logs/out/s4d_unit_seed$SEED.config" --freq 25 --seed "$SEED" --report "raw_logs/nextpnr_report_seed$SEED.json" --detailed-timing-report 2>&1 | tee "raw_logs/nextpnr_seed$SEED.log"
+            echo "B197_SEED_DONE=$SEED"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,statistics,re
+          rows=[]
+          for sd in [1,2,3,4]:
+              rp=Path('raw_logs/nextpnr_report.json') if sd==1 else Path(f'raw_logs/nextpnr_report_seed{sd}.json')
+              lg=Path('raw_logs/nextpnr.log') if sd==1 else Path(f'raw_logs/nextpnr_seed{sd}.log')
+              report=json.loads(rp.read_text())
+              freq=next(iter(report['fmax'].values()))['achieved']
+              assert freq>0
+              section=lg.read_text(errors='replace').split('Critical path report for clock',1)[1].split('Critical path report for cross-domain',1)[0]
+              src=re.search(r'Source\s+([^\s]+)',section)
+              sinks=re.findall(r'Sink\s+([^\s]+)',section)
+              rows.append({'seed':sd,'post_route_fmax_mhz':freq,'first_source':src.group(1) if src else 'UNPARSED','last_sink':sinks[-1] if sinks else 'UNPARSED'})
+          freqs=[r['post_route_fmax_mhz'] for r in rows]
+          summary={'scope':'UPSTREAM_S4D_UNIT_ONLY_NOT_MAMBA3_GDN_OR_PUBLISHABLE_ACCELERATOR_PPA','same_rtl_netlist_device_constraints':True,'seed_results':rows,'mean_fmax_mhz':statistics.mean(freqs),'min_fmax_mhz':min(freqs),'max_fmax_mhz':max(freqs),'spread_percent_of_mean':(max(freqs)-min(freqs))/statistics.mean(freqs)*100,'sample_stdev_mhz':statistics.stdev(freqs),'function_test':'NONZERO_B0_U_EXPECTED_256'}
+          Path('raw_logs/B197_multiseed_summary.json').write_text(json.dumps(summary,indent=2))
+          print('B197_S4D_MULTISEED_PASS',json.dumps(summary))
           PY
           date -u -Is
       - name: Upload all original logs even on failure
