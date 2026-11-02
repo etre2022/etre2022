@@ -1,0 +1,84 @@
+name: B197 R9 unreviewed ternary-Mamba artifact provenance gate
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R9_ternary_prior_gate.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit-public-data:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - name: Independent reproducibility of CC-BY public classification and latency CSV
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p B197_R9_ternary
+          exec > >(tee B197_R9_ternary/full.log) 2>&1
+          trap 'rc=$?; echo "B197_R9_TERNARY_EXIT=$rc"; date -u -Is' EXIT
+          echo 'SCOPE=THIRD_PARTY_PUBLIC_CSV_REANALYSIS_NOT_HARDWARE_MEASUREMENT_NO_KERNEL_RTL'
+          date -u -Is
+          git clone --filter=blob:none --no-checkout https://github.com/orionparrott/fpga-mamba-inference-artifacts.git upstream
+          git -C upstream checkout --detach 50dbdde33c23831e8473260090764d9f19b3a391
+          test "$(git -C upstream rev-parse HEAD)" = 50dbdde33c23831e8473260090764d9f19b3a391
+          test ! -e upstream/kernel.cpp
+          test ! -e upstream/rtl
+          test -f upstream/LICENSE
+          sha256sum upstream/data/p1/silicon_predictions.csv upstream/data/p3/fp_predictions.csv upstream/data/p4/p4_case3_n1000.csv upstream/analysis/mcnemar_p3.py upstream/analysis/latency_stats.py upstream/README.md > B197_R9_ternary/input_sha256.txt
+          python3 upstream/analysis/mcnemar_p3.py upstream/data/p1/silicon_predictions.csv upstream/data/p3/fp_predictions.csv | tee B197_R9_ternary/mcnemar_upstream_recalc.log
+          python3 upstream/analysis/latency_stats.py upstream/data/p4/p4_case3_n1000.csv | tee B197_R9_ternary/latency_upstream_recalc.log
+          python3 - <<'PY'
+          import csv,statistics,math,json,hashlib
+          from pathlib import Path
+          a=list(csv.DictReader(open('upstream/data/p1/silicon_predictions.csv')))
+          b=list(csv.DictReader(open('upstream/data/p3/fp_predictions.csv')))
+          assert len(a)==len(b)==7600
+          cases={int(x['case']):x for x in a}
+          fp={int(x['case']):x for x in b}
+          assert cases.keys()==fp.keys()
+          successes=sum(int(x['correct']) for x in a)
+          assert successes==6888,(successes,len(a))
+          for r in a:assert int(r['correct'])==int(int(r['silicon_argmax'])==int(r['label']))
+          b_only=c_only=both=neither=0
+          for k,x in cases.items():
+             t=int(x['silicon_argmax'])==int(x['label'])
+             f=int(fp[k]['fp_argmax'])==int(x['label'])
+             if t and f:both+=1
+             elif t:b_only+=1
+             elif f:c_only+=1
+             else:neither+=1
+          n=b_only+c_only
+          # Exact McNemar binomial two-sided.
+          m=min(b_only,c_only)
+          p=min(1.,2*sum(math.comb(n,i) for i in range(m+1))/(2**n)) if n else 1.
+          vals=sorted(float(r[0]) for r in list(csv.reader(open('upstream/data/p4/p4_case3_n1000.csv')))[1:])
+          assert len(vals)==1000
+          mean=statistics.mean(vals);p99=vals[int(.99*(len(vals)-1))]
+          ratio=p99/mean
+          assert abs(ratio-1.0004)<0.0003,(ratio,'outside published figure')
+          assert abs(p-.4739)<.002,(p,'outside published figure')
+          out={'scope':'RECOMPUTE_THIRD_PARTY_PUBLIC_RECORDS_NOT_INDEPENDENT_SILICON',
+             'source_commit':'50dbdde33c23831e8473260090764d9f19b3a391',
+             'n_examples':len(a),'silicon_correct_from_public_csv':successes,'silicon_accuracy_from_public_csv':successes/len(a),
+             'fp_correct_from_public_csv':both+c_only,'fp_accuracy_from_public_csv':(both+c_only)/len(a),
+             'both_correct':both,'ternary_only_correct':b_only,'fp_only_correct':c_only,'neither_correct':neither,
+             'mcnemar_exact_two_sided_p':p,'fixed_input_n_repeated':len(vals),'fixed_input_mean_ms':mean*1000,
+             'p99_ms':p99*1000,'p99_to_mean':ratio,
+             'can_recompute_silicon_csv':True,'can_reimplement_HLS_or_routed_silicon':False,
+             'HLS_source_released':False,'AFI_publicly_loadable_from_artifact':False,
+             'paper_status':'README says arXiv link pending','not_Circuits_TCAS_peer_reviewed_proof':True,
+             'interpretation':'prior-art collision risk for ternary-on-chip Mamba idea; no independent hardware reproducibility'}
+          Path('B197_R9_ternary/R9_ternary_data_audit.json').write_text(json.dumps(out,indent=2))
+          print('B197_R9_TERNARY_PRIOR_PUBLIC_DATA_PASS',json.dumps({k:out[k] for k in ['n_examples','silicon_correct_from_public_csv','fp_correct_from_public_csv','mcnemar_exact_two_sided_p','p99_to_mean']}))
+          PY
+          sha256sum B197_R9_ternary/R9_ternary_data_audit.json > B197_R9_ternary/outputs_sha256.txt
+      - name: Archive derived data and process logs only (no original CSV or model)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R9-ternary-prior-art-public-data-audit
+          path: B197_R9_ternary/
+          retention-days: 7
+          if-no-files-found: warn
