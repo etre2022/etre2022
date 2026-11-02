@@ -62,9 +62,7 @@ before('  rmsnorm<kDim>(attn_norm, x, side + kSideRmsFinalOffset);',
        '  b197_trace_f("K","last_layer",token,7,x,kDim);')
 after('  rmsnorm<kDim>(attn_norm, x, side + kSideRmsFinalOffset);',
       '  b197_trace_f("K","final_rms",token,-1,attn_norm,kDim);')
-# Marker at end of K layer, immediately before final RMSNorm
-before('  b197_trace_f("K","last_layer",token,7,x,kDim);',
-       '  // Last layer has already completed; preceding layers are reported at the FFN residual.')
+# Marker at end of kernel loop, immediately before final RMSNorm
 # CPU source
 before('  const float q_scale = 1.0f / std::sqrt(static_cast<float>(kHeadKDim));',
        '  b197_trace_f("C","embed",token,-1,s.x.data(),kDim);')
