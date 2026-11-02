@@ -1,0 +1,116 @@
+name: B197 GDN checkpoint metadata-only controlled A/B
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_checkpoint_ab.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu-semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 13
+    steps:
+      - name: Test bit-identical CPU outputs for two isolated metadata-only repairs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs
+          exec > >(tee logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_META_AB_EXIT=$rc"; date -u -Is' EXIT
+          echo 'B197_SCOPE=UPSTREAM_GDN_NATIVE_CPU_ONLY_METADATA_REPAIR_NOT_VITIS_NOT_KV260'
+          date -u -Is; uname -a
+          g++ --version | head -1; cmake --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git original
+          git -C original checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C original rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          cp original/src/config.hpp logs/config_original.hpp
+          sha256sum original/src/*.cpp original/src/*.hpp original/model/tinystories15M_q8.bin > logs/original_source_and_checkpoint_sha256.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct,json,hashlib,shutil
+          src=Path('original/model/tinystories15M_q8.bin')
+          a=src.read_bytes()
+          dims=struct.unpack_from('<11i',a,8)
+          names='dim hidden_dim n_layers num_heads head_k_dim head_v_dim conv_size vocab_size seq_len shared_classifier pad'.split()
+          header=dict(zip(names,dims))
+          assert all(header.get(k)==v for k,v in [('dim',256),('hidden_dim',768),('n_layers',8),('num_heads',8),('head_k_dim',32),('head_v_dim',32),('conv_size',4),('vocab_size',32000),('shared_classifier',1)])
+          assert header['seq_len']!=1024,header
+          print('B197_GDN_ACTUAL_CHECKPOINT_HEADER',json.dumps(header))
+          b=bytearray(a)
+          struct.pack_into('<i',b,40,1024)
+          differences=[i for i,(x,y) in enumerate(zip(a,b)) if x!=y]
+          assert differences and all(40<=x<44 for x in differences),differences
+          p=Path('meta_adjusted.bin');p.write_bytes(b)
+          Path('config_variant/src').mkdir(parents=True,exist_ok=True)
+          for file in Path('original/src').glob('*'):shutil.copy2(file,Path('config_variant/src')/file.name)
+          c=Path('config_variant/src/config.hpp')
+          old=c.read_text()
+          assert old.count('constexpr int kSeqLen = 1024;')==1
+          c.write_text(old.replace('constexpr int kSeqLen = 1024;',f"constexpr int kSeqLen = {header['seq_len']};"))
+          info={'header':header,'checkpoint_original_sha256':hashlib.sha256(a).hexdigest(),'checkpoint_header_shim_sha256':hashlib.sha256(b).hexdigest(),'header_shim_modified_byte_offsets':differences,'config_variant_only_one_line_modified':True,'scope':'metadata-only compatibility, not upstream-as-is baseline'}
+          Path('logs/metadata_ab.json').write_text(json.dumps(info,indent=2))
+          print('B197_GDN_META_AB_AUDIT',json.dumps(info))
+          PY
+          cat > logs/cpu_step_trace.cpp <<'CPP'
+          #include "decode.hpp"
+          #include "weight.hpp"
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstring>
+          #include <vector>
+          #include <cstdlib>
+          #include <cmath>
+          static uint64_t HashBits(const std::vector<float>& v){
+            uint64_t h=0xcbf29ce484222325ULL;
+            for (float f:v){
+              uint32_t x; std::memcpy(&x,&f,sizeof(x));
+              h^=x; h*=0x100000001b3ULL;
+            }
+            return h;
+          }
+          int main(int argc,char** argv){
+            if(argc!=2) return 90;
+            gdn::Weights w;gdn::LoadWeights(w,argv[1]);
+            gdn::RunState state;
+            std::vector<float> logits(gdn::kVocabSize,0.f);
+            const int drive[]={1,9038,2501,263,931,29892,297,263,2319,4726,4257,4726,29892,10600,1023,1900};
+            for(int n=0;n<16;n++){
+              gdn::CpuForward(state,w,drive[n],logits.data());
+              int id=gdn::ArgmaxLogits(logits.data(),gdn::kVocabSize);
+              if(id<0||id>=gdn::kVocabSize||state.S.size()!=gdn::kSStateCount) return 71;
+              uint64_t h=HashBits(state.S);
+              uint32_t v;std::memcpy(&v,&logits[id],4);
+              std::printf("STEP %02d input=%d top1=%d logit_bits=%08x S_state_hash=%016llx\n",n,drive[n],id,v,(unsigned long long)h);
+            }
+            return 0;
+          }
+          CPP
+          g++ -O2 -std=c++20 -DUSE_CPU_ONLY -Ioriginal/src original/src/decode.cpp original/src/weight.cpp logs/cpu_step_trace.cpp -o logs/trace_header_shim
+          g++ -O2 -std=c++20 -DUSE_CPU_ONLY -Iconfig_variant/src config_variant/src/decode.cpp config_variant/src/weight.cpp logs/cpu_step_trace.cpp -o logs/trace_const_shim
+          timeout 180s ./logs/trace_header_shim meta_adjusted.bin > logs/header_adjustment_trace.log
+          timeout 180s ./logs/trace_const_shim original/model/tinystories15M_q8.bin > logs/constant_adjustment_trace.log
+          cmp logs/header_adjustment_trace.log logs/constant_adjustment_trace.log
+          cat logs/header_adjustment_trace.log
+          echo B197_GDN_METADATA_AB_BYTE_IDENTICAL_16_STEPS_PASS
+          # Test the real upstream default remains incompatible; do not erase original defect.
+          test ! -e original/model/climbmix15M_demo_q8.bin
+          echo B197_UPSTREAM_DEFAULT_FILENAME_MISSING_CONFIRMED
+          echo 'v++:'; command -v v++ || echo 'BLOCKED_NOT_INSTALLED'
+          echo 'KV260 device nodes:'; ls /dev/xclmgmt* /dev/dri/renderD* 2>&1 || true
+          cp original/src/weight.cpp logs/upstream_weight_loader.cpp
+          cp original/src/config.hpp logs/upstream_config.hpp
+          sha256sum logs/*trace.log logs/metadata_ab.json > logs/checksum_outputs.txt
+      - name: Preserve only logs and small reference code (do not upload model weights)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-metadata-AB-CPU-exactness
+          path: |
+            logs/*.log
+            logs/*.json
+            logs/*.txt
+            logs/*.cpp
+            logs/*.hpp
+          retention-days: 7
+          if-no-files-found: warn
