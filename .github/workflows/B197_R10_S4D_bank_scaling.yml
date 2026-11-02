@@ -1,0 +1,79 @@
+name: B197 R10 MIT S4D full bank physical scaling
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R10_S4D_bank_scaling.yml']
+permissions:
+  contents: read
+jobs:
+  bank:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [2, 4, 8]
+    env:
+      NUNITS: ${{ matrix.n }}
+    steps:
+      - name: MIT upstream S4D bank native synthesis and real ECP5 PNR
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs/out
+          exec > >(tee logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_R10_EXIT=$rc NUNITS=$NUNITS"; date -u -Is' EXIT
+          echo "B197_SCOPE=UNMODIFIED_MIT_S4D_BANK_NOT_MAMBA3_GDN_OR_TCAS_PPA"
+          date -u -Is
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends yosys nextpnr-ecp5 nextpnr-ecp5-chipdb
+          yosys -V; nextpnr-ecp5 --version
+          git clone --filter=blob:none --no-checkout https://github.com/D1nDo/S4_Silicon_ZCU104.git source
+          git -C source checkout --detach bf6c7f0344349803a2ff197a23bbac9dab6669dd
+          test "$(git -C source rev-parse HEAD)" = bf6c7f0344349803a2ff197a23bbac9dab6669dd
+          cp source/new/s4d_biquad_unit.v logs/unit.v
+          cp source/new/s4d_biquad_bank.v logs/bank.v
+          cp source/LICENSE logs/LICENSE
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          for name,sha in [('unit.v','56d109a83c2a0a29baed44a02c3e669a4d8ee708'),('bank.v','6e5e2315719d3380ed8e7f4b8d6d4561b0e64520')]:
+            b=Path('logs',name).read_bytes()
+            gitblob=hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()
+            assert gitblob==sha,(name,gitblob,sha)
+          print('B197_R10_MIT_SOURCE_PASS')
+          PY
+          case "$NUNITS" in 2) LOG2_NU=1;LOG2_H=3;H=8;; 4) LOG2_NU=2;LOG2_H=4;H=16;; 8) LOG2_NU=3;LOG2_H=5;H=32;; *) exit 32;; esac
+          echo "B197_R10_CONFIG NUNITS=$NUNITS H=$H"
+          SYN="read_verilog -sv logs/unit.v logs/bank.v; hierarchy -top s4d_biquad_bank -chparam H $H -chparam LOG2_H $LOG2_H -chparam NUNITS $NUNITS -chparam LOG2_NU $LOG2_NU -chparam NCH 4 -chparam LOG2_NCH 2 -chparam MODES 32 -chparam LOG2_MOD 5 -chparam LOG2_NB 7; synth_ecp5 -top s4d_biquad_bank -json logs/out/bank.json; stat"
+          echo "$SYN" >logs/synthesis_command.txt
+          timeout 480s yosys -Q -T -l logs/yosys.log -p "$SYN"
+          echo B197_R10_SYNTH_PASS
+          for SEED in 1 2; do
+            timeout 480s nextpnr-ecp5 --85k --package CABGA756 --speed 6 --json logs/out/bank.json --textcfg "logs/out/seed$SEED.config" --freq 100 --timing-allow-fail --seed "$SEED" --report "logs/seed$SEED.json" --detailed-timing-report 2>&1 | tee "logs/seed$SEED.log"
+            echo "B197_R10_PNR_DONE=$SEED"
+          done
+          python3 - <<'PY'
+          import json,os
+          from pathlib import Path
+          n=int(os.environ['NUNITS'])
+          rows=[]
+          for sd in [1,2]:
+            d=json.loads(Path('logs',f'seed{sd}.json').read_text())
+            f=float(next(iter(d['fmax'].values()))['achieved'])
+            u={k:int(v['used']) for k,v in d['utilization'].items() if v['used']}
+            assert f>0 and u.get('MULT18X18D',0)>0 and u.get('TRELLIS_COMB',0)>0
+            assert Path('logs/out',f'seed{sd}.config').stat().st_size>0
+            rows.append({'seed':sd,'Fmax_MHz':f,'passes_100MHz':f>=100,'resources':u})
+          out={'source_commit':'bf6c7f0344349803a2ff197a23bbac9dab6669dd','license':'MIT','top':'s4d_biquad_bank','target':'ECP5 LFE5U-85F CABGA756 speed-6','nunits':n,'nch':4,'modes':32,'channels':n*4,'rows':rows,'test_scope':'S4D bank, NOT Mamba3/GDN/TCAS-II PPA','no_board_test':True,'no_io_constraints':True,'no_new_microarchitecture':True}
+          Path('logs/summary.json').write_text(json.dumps(out,indent=2))
+          print('B197_R10_BANK_PNR_PASS',json.dumps(out))
+          PY
+      - name: Save original logs including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R10-S4D-bank-${{ matrix.n }}
+          path: logs/
+          retention-days: 8
+          if-no-files-found: warn
