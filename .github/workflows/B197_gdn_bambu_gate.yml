@@ -22,6 +22,9 @@ jobs:
           echo 'SCOPE=OPEN_SOURCE_BAMBU_HLS_COMPATIBILITY_ONLY_NOT_VITIS_NOT_KV260_PPA'
           date -u -Is; uname -a; df -h .
           g++ --version | head -1
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-multilib g++-multilib libc6-dev-i386
+          echo B197_CLANG_I386_HEADERS_READY
           echo 'BAMBU_RELEASE_URL=https://release.bambuhls.eu/bambu-2024.10.AppImage'
           set +e
           curl --fail --location --show-error --silent --retry 2 --max-time 165 \
