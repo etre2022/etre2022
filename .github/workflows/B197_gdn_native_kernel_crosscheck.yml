@@ -1,0 +1,100 @@
+name: B197 GDN native original kernel crosscheck via minimal ap-int shim
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_native_kernel_crosscheck.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  kernel-vs-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 17
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify shim, compile original GDN kernel unchanged, compare greedy tokens
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p b197_runs/kernel_crosscheck/upstream B197_logs
+          exec > >(tee B197_logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_NATIVE_KERNEL_CI_EXIT=$rc"; date -u -Is' EXIT
+          date -u -Is; uname -a
+          echo "SCOPE=EMULATED_AP_INT_NATIVE_CXX__NOT_VITIS_HLS__NOT_FPGA_PPA"
+          g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git b197_runs/kernel_crosscheck/upstream/gdn
+          git -C b197_runs/kernel_crosscheck/upstream/gdn checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          UPSTREAM=b197_runs/kernel_crosscheck/upstream/gdn
+          test "$(git -C "$UPSTREAM" rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          echo B197_ORIGINAL_UPSTREAM_COMMIT_VERIFIED
+          sha256sum "$UPSTREAM/src/decode.cpp" "$UPSTREAM/tools/kernel_sim.cpp" "$UPSTREAM/src/weight.cpp" b197/native_only_compat/ap_int.h > B197_logs/input_sha256.txt
+          python3 - <<'PY'
+          import struct,hashlib,json
+          from pathlib import Path
+          p=Path('b197_runs/kernel_crosscheck/upstream/gdn/model/tinystories15M_q8.bin')
+          b=bytearray(p.read_bytes())
+          sha0=hashlib.sha256(b).hexdigest()
+          assert sha0=='63fe5c9bca6bbf7abfd05ab5c67e9fb58d8ba25d4184a65d22e04c9179e78b64',sha0
+          assert struct.unpack_from('<I',b,0)[0]==0x47444e65
+          assert struct.unpack_from('<i',b,4)[0]==2
+          assert struct.unpack_from('<i',b,40)[0]==256
+          struct.pack_into('<i',b,40,1024)
+          changed=[i for i,(a,c) in enumerate(zip(p.read_bytes(),b)) if a!=c]
+          assert changed==[41],changed
+          cp=Path('/tmp/B197_gdn_kernel_shim_checkpoint.bin')
+          cp.write_bytes(b)
+          sha1=hashlib.sha256(b).hexdigest()
+          assert sha1=='7dbe38e0115c94cdeff3f4acb7127a74efddd8843c7915c287a928d57ba497f0',sha1
+          (Path('B197_logs')/'checkpoint_contract.json').write_text(json.dumps({'source_checkpoint_sha256':sha0,'patched_header_sha256':sha1,'modified_offsets':changed,'source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d'},indent=2))
+          print('B197_CHECKPOINT_META_SINGLE_BYTE_SHIM_VERIFIED')
+          PY
+          mkdir -p b197_runs/kernel_crosscheck/build
+          INC="-Ib197/native_only_compat -I$UPSTREAM/src"
+          g++ -O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas $INC -DBUILD_DECODE_KERNEL -c "$UPSTREAM/src/decode.cpp" -o b197_runs/kernel_crosscheck/build/decode_kernel.o 2>&1 | tee B197_logs/build_kernel.log
+          echo B197_ORIGINAL_KERNEL_COMPILE_PASS
+          g++ -O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas $INC -DUSE_CPU_ONLY -c "$UPSTREAM/src/decode.cpp" -o b197_runs/kernel_crosscheck/build/decode_cpu.o 2>&1 | tee B197_logs/build_cpu.log
+          g++ -O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas $INC -c "$UPSTREAM/src/weight.cpp" -o b197_runs/kernel_crosscheck/build/weight.o 2>&1 | tee B197_logs/build_weight.log
+          g++ -O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas $INC -DUSE_CPU_ONLY -c "$UPSTREAM/tools/kernel_sim.cpp" -o b197_runs/kernel_crosscheck/build/kernel_sim.o 2>&1 | tee B197_logs/build_kernel_sim.log
+          g++ b197_runs/kernel_crosscheck/build/{decode_kernel.o,decode_cpu.o,weight.o,kernel_sim.o} -lm -o b197_runs/kernel_crosscheck/build/kernel_sim
+          echo B197_ORIGINAL_KERNEL_SIM_LINK_PASS
+          set +e
+          timeout 240s b197_runs/kernel_crosscheck/build/kernel_sim /tmp/B197_gdn_kernel_shim_checkpoint.bin 16 > B197_logs/kernel_sim_16.log 2>&1
+          STATUS16=$?
+          set -e
+          echo "B197_KERNEL_SIM_16_EXIT=$STATUS16"
+          cat B197_logs/kernel_sim_16.log
+          if [ "$STATUS16" -ne 0 ]; then echo B197_KERNEL_NATIVE_16_FAIL; exit "$STATUS16"; fi
+          grep -q 'PASSED (0 mismatch of 16)' B197_logs/kernel_sim_16.log
+          echo B197_KERNEL_NATIVE_16_PASS
+          set +e
+          timeout 300s b197_runs/kernel_crosscheck/build/kernel_sim /tmp/B197_gdn_kernel_shim_checkpoint.bin 64 > B197_logs/kernel_sim_64.log 2>&1
+          STATUS64=$?
+          set -e
+          echo "B197_KERNEL_SIM_64_EXIT=$STATUS64"
+          tail -70 B197_logs/kernel_sim_64.log
+          if [ "$STATUS64" -ne 0 ]; then echo B197_KERNEL_NATIVE_64_FAIL; exit "$STATUS64"; fi
+          grep -q 'PASSED (0 mismatch of 64)' B197_logs/kernel_sim_64.log
+          echo B197_KERNEL_NATIVE_64_PASS
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          a=Path('B197_logs/kernel_sim_16.log').read_text()
+          b=Path('B197_logs/kernel_sim_64.log').read_text()
+          count=lambda s:len(re.findall(r'^step\s+\d+',s,re.M))
+          d={'source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d','original_gdn_kernel_cpp_unmodified':True,'native_ap_int_emulation':True,'vitis_csim':False,'vitis_rtl_cosim':False,'fpga_ppa':False,'steps_16':count(a),'steps_64':count(b),'native_16_pass': 'PASSED (0 mismatch of 16)' in a,'native_64_pass': 'PASSED (0 mismatch of 64)' in b}
+          assert d['steps_16']==16 and d['steps_64']==64
+          assert d['native_16_pass'] and d['native_64_pass']
+          Path('B197_logs/B197_kernel_results.json').write_text(json.dumps(d,indent=2))
+          print('B197_NATIVE_GDN_ORIGINAL_KERNEL_64_STEPS_PASS',json.dumps(d))
+          PY
+          echo 'Vitis check:'; command -v v++ || echo NO_VITIS
+      - name: Archive original logs and locally authored compatibility shim only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-original-kernel-native-crosscheck
+          path: |
+            B197_logs/
+            b197/native_only_compat/ap_int.h
+          retention-days: 8
+          if-no-files-found: warn
