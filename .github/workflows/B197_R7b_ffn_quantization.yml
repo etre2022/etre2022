@@ -1,0 +1,60 @@
+name: B197 R7b FFN quantization amplification trace
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_R7b_ffn_quantization.yml', 'b197/r7b_instrument.py', 'b197/r7_analyze.py', 'b197/r7_stage_driver.cpp']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  stage-trace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage-by-stage native GDN Kernel vs CPU diagnostic
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p B197_logs build
+          exec > >(tee B197_logs/job.log) 2>&1
+          trap 'rc=$?; echo "B197_R7_CI_EXIT=$rc"; date -u -Is' EXIT
+          date -u -Is
+          echo 'B197_SCOPE=INSTRUMENTED_NATIVE_CXX_ONLY_NOT_VITIS_CSIM_NOT_RTL_NOT_FPGA'
+          g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          sha256sum upstream/src/decode.cpp upstream/src/weight.cpp upstream/model/tinystories15M_q8.bin b197/native_only_compat/ap_int.h > B197_logs/upstream_sha256.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,struct
+          b=bytearray(Path('upstream/model/tinystories15M_q8.bin').read_bytes())
+          assert hashlib.sha256(b).hexdigest()=='63fe5c9bca6bbf7abfd05ab5c67e9fb58d8ba25d4184a65d22e04c9179e78b64'
+          assert struct.unpack_from('<i',b,40)[0]==256
+          struct.pack_into('<i',b,40,1024)
+          assert hashlib.sha256(b).hexdigest()=='7dbe38e0115c94cdeff3f4acb7127a74efddd8843c7915c287a928d57ba497f0'
+          Path('/tmp/B197_R7_meta.bin').write_bytes(b)
+          print('B197_R7_SINGLE_BYTE_META_SHIM_PASS')
+          PY
+          python3 b197/r7b_instrument.py
+          F="-O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas -Ib197/native_only_compat -Iupstream/src"
+          g++ $F -DBUILD_DECODE_KERNEL -c build/instrumented_decode.cpp -o build/kernel.o 2>&1 | tee B197_logs/kernel_build.log
+          g++ $F -DUSE_CPU_ONLY -c build/instrumented_decode.cpp -o build/cpu.o 2>&1 | tee B197_logs/cpu_build.log
+          g++ $F -c upstream/src/weight.cpp -o build/weight.o
+          g++ $F -DUSE_CPU_ONLY -c b197/r7_stage_driver.cpp -o build/driver.o
+          g++ build/kernel.o build/cpu.o build/weight.o build/driver.o -lm -o build/trace
+          echo B197_R7_BUILD_PASS
+          timeout 120s build/trace /tmp/B197_R7_meta.bin > B197_logs/stage_bits.log 2>&1
+          grep '^B197_END_TOKEN' B197_logs/stage_bits.log
+          python3 b197/r7_analyze.py
+          sha256sum B197_logs/stage_bits.log B197_logs/stage_comparison.csv > B197_logs/output_hashes.txt
+          echo B197_R7_FIRST_DIVERGENCE_TRACE_PASS
+      - name: Archive trace data and instrumentation provenance, no upstream source or weights
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-R7b-FFN-quant-trace
+          path: B197_logs/
+          if-no-files-found: warn
+          retention-days: 7
