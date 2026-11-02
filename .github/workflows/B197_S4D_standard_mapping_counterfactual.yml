@@ -1,0 +1,99 @@
+name: B197 S4D standard-mapping counterfactual
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_S4D_standard_mapping_counterfactual.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mapping-sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, noabc9, retime, noccu2, nowidelut]
+    env:
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Synthesis and 3 routed seeds on original upstream S4D RTL
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p raw_logs/out upstream
+          exec > >(tee raw_logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_EXIT=$rc VARIANT=$VARIANT"; date -u -Is' EXIT
+          echo "B197_SCOPE=UNMODIFIED_S4D_BIQUAD_NOT_MAMBA3_NOT_GDN"
+          date -u -Is
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends yosys nextpnr-ecp5 nextpnr-ecp5-chipdb iverilog
+          { dpkg-query -W yosys nextpnr-ecp5 nextpnr-ecp5-chipdb iverilog; yosys -V; nextpnr-ecp5 --version; } > raw_logs/tool_versions.txt
+          yosys -Q -p 'help synth_ecp5' > raw_logs/synth_ecp5_options.txt
+          nextpnr-ecp5 --help > raw_logs/nextpnr_options.txt 2>&1
+          grep -q -- '--timing-allow-fail' raw_logs/nextpnr_options.txt
+          git clone --filter=blob:none --no-checkout https://github.com/D1nDo/S4_Silicon_ZCU104.git upstream/S4D
+          git -C upstream/S4D checkout --detach bf6c7f0344349803a2ff197a23bbac9dab6669dd
+          test "$(git -C upstream/S4D rev-parse HEAD)" = "bf6c7f0344349803a2ff197a23bbac9dab6669dd"
+          cp upstream/S4D/new/s4d_biquad_unit.v raw_logs/original_s4d_biquad_unit.v
+          cp upstream/S4D/LICENSE raw_logs/upstream_LICENSE
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p=Path('raw_logs/original_s4d_biquad_unit.v')
+          b=p.read_bytes()
+          sha=hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()
+          assert sha=='56d109a83c2a0a29baed44a02c3e669a4d8ee708',sha
+          print('B197_ORIGINAL_GIT_SHA_PASS',sha)
+          PY
+          sha256sum raw_logs/original_s4d_biquad_unit.v >raw_logs/source_sha256.txt
+          OPT=""
+          case "$VARIANT" in
+            default) OPT="" ;;
+            noabc9) OPT="-noabc9" ;;
+            retime) OPT="-retime" ;;
+            noccu2) OPT="-noccu2" ;;
+            nowidelut) OPT="-nowidelut" ;;
+            *) exit 31 ;;
+          esac
+          echo "B197_VARIANT=$VARIANT SYNTH_OPTIONS=$OPT"
+          YOSYS_CMD="read_verilog -sv raw_logs/original_s4d_biquad_unit.v; hierarchy -top s4d_biquad_unit -chparam NCH 4 -chparam MODES 32 -chparam LOG2_NB 7 -chparam LOG2_MOD 5 -chparam LOG2_CH 2; synth_ecp5 -top s4d_biquad_unit $OPT -json raw_logs/out/s4d.json; stat"
+          echo "$YOSYS_CMD" >raw_logs/synthesis_command.txt
+          timeout 300s yosys -Q -T -l raw_logs/yosys.log -p "$YOSYS_CMD"
+          sha256sum raw_logs/out/s4d.json >raw_logs/netlist_sha256.txt
+          echo B197_SYNTH_PASS
+          for SEED in 1 2 3; do
+            echo "B197_ROUTE_START VARIANT=$VARIANT SEED=$SEED 100MHz"
+            timeout 360s nextpnr-ecp5 --85k --package CABGA756 --speed 6 --json raw_logs/out/s4d.json --textcfg "raw_logs/out/s4d_seed$SEED.config" --freq 100 --timing-allow-fail --seed "$SEED" --report "raw_logs/nextpnr_seed$SEED.json" --detailed-timing-report 2>&1 | tee "raw_logs/nextpnr_seed$SEED.log"
+            test -s "raw_logs/out/s4d_seed$SEED.config"
+            echo "B197_ROUTE_DONE VARIANT=$VARIANT SEED=$SEED"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,json,statistics,hashlib,re
+          variant=os.environ['VARIANT']
+          rows=[]
+          for sd in (1,2,3):
+              r=json.loads(Path(f'raw_logs/nextpnr_seed{sd}.json').read_text())
+              f=list(r['fmax'].values())[0]
+              achieved=float(f['achieved'])
+              assert achieved>0
+              used={k:v['used'] for k,v in r['utilization'].items() if v['used']}
+              log=Path(f'raw_logs/nextpnr_seed{sd}.log').read_text()
+              m=re.search(r"Critical path report for clock[^:]*:([\s\S]*?)(?:Critical path report for cross-domain|Slack histogram:)",log)
+              section=m.group(1) if m else ''
+              sources=re.findall(r'Source\s+([^\s]+)',section)
+              sinks=re.findall(r'Sink\s+([^\s]+)',section)
+              rows.append({'seed':sd,'fmax_mhz':achieved,'target_mhz':100,'timing_pass':achieved>=100,'first_source':sources[0] if sources else None,'last_sink':sinks[-1] if sinks else None,'resources':used})
+          out={'scope':'UNMODIFIED_S4D_ECP5_MAPPING_ABLATION_NOT_FULL_MODEL','variant':variant,'upstream_commit':'bf6c7f0344349803a2ff197a23bbac9dab6669dd','rtl_git_blob':'56d109a83c2a0a29baed44a02c3e669a4d8ee708','device':'LFE5U-85F CABGA756 speed-6','target_mhz':100,'seed_results':rows,'fmax_mean':statistics.mean(x['fmax_mhz'] for x in rows),'fmax_min':min(x['fmax_mhz'] for x in rows),'fmax_max':max(x['fmax_mhz'] for x in rows),'mapped_netlist_sha256':hashlib.sha256(Path('raw_logs/out/s4d.json').read_bytes()).hexdigest(),'source_sha256':hashlib.sha256(Path('raw_logs/original_s4d_biquad_unit.v').read_bytes()).hexdigest(),'warning':'--timing-allow-fail permits routing below 100MHz; no end-to-end/board PPA; no mapped-netlist formal equivalence'}
+          Path('raw_logs/B197_variant_summary.json').write_text(json.dumps(out,indent=2))
+          print('B197_VARIANT_RESULTS',json.dumps({'variant':variant,'mean_mhz':out['fmax_mean'],'rows':rows,'netlist_sha256':out['mapped_netlist_sha256']}))
+          PY
+      - name: Preserve receipts even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-S4D-mapping-${{ matrix.variant }}
+          path: raw_logs/
+          retention-days: 8
+          if-no-files-found: warn
