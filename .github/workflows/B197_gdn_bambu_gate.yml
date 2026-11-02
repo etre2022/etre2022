@@ -1,0 +1,86 @@
+name: B197 GDN public Bambu HLS frontend compatibility gate
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_bambu_gate.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bambu-gdn-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Attempt open-source HLS of unchanged upstream GDN Kernel with Bambu release 2024.10
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p B197_logs build upstream_checkout
+          exec > >(tee B197_logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_BAMBU_GATE_EXIT=$rc"; date -u -Is' EXIT
+          echo 'SCOPE=OPEN_SOURCE_BAMBU_HLS_COMPATIBILITY_ONLY_NOT_VITIS_NOT_KV260_PPA'
+          date -u -Is; uname -a; df -h .
+          g++ --version | head -1
+          echo 'BAMBU_RELEASE_URL=https://release.bambuhls.eu/bambu-2024.10.AppImage'
+          set +e
+          curl --fail --location --show-error --silent --retry 2 --max-time 165 \
+            https://release.bambuhls.eu/bambu-2024.10.AppImage -o build/bambu-2024.10.AppImage
+          DL_RC=$?
+          set -e
+          echo "B197_BAMBU_DOWNLOAD_EXIT=$DL_RC"
+          if [ "$DL_RC" -ne 0 ]; then exit "$DL_RC"; fi
+          chmod +x build/bambu-2024.10.AppImage
+          sha256sum build/bambu-2024.10.AppImage | tee B197_logs/bambu_binary_sha256.txt
+          ls -lh build/bambu-2024.10.AppImage
+          set +e
+          timeout 55s build/bambu-2024.10.AppImage --appimage-extract-and-run --version > B197_logs/bambu_version.log 2>&1
+          VER_RC=$?
+          set -e
+          echo "B197_BAMBU_VERSION_EXIT=$VER_RC"
+          tail -40 B197_logs/bambu_version.log
+          if [ "$VER_RC" -ne 0 ]; then exit "$VER_RC"; fi
+          timeout 55s build/bambu-2024.10.AppImage --appimage-extract-and-run --help > B197_logs/bambu_help.log 2>&1 || true
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream_checkout/gdn
+          git -C upstream_checkout/gdn checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream_checkout/gdn rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          sha256sum upstream_checkout/gdn/src/decode.cpp b197/native_only_compat/ap_int.h > B197_logs/source_provenance.txt
+          echo 'B197_ORIGINAL_UNMODIFIED_GDN_SOURCE_PINNED'
+          echo 'B197_HLS_ARGUMENTS=--top-fname=decode --compiler=I386_CLANG16 --device-name=LFE5U85F,8,BG756C --clock-period=12.5 --generate-interface=INFER -O2 -DBUILD_DECODE_KERNEL'
+          set +e
+          (
+            cd build
+            timeout 280s ./bambu-2024.10.AppImage --appimage-extract-and-run \
+              ../upstream_checkout/gdn/src/decode.cpp --top-fname=decode \
+              --compiler=I386_CLANG16 --device-name=LFE5U85F,8,BG756C \
+              --clock-period=12.5 --generate-interface=INFER \
+              -Ib197/native_only_compat \
+              -I../upstream_checkout/gdn/src -DBUILD_DECODE_KERNEL -O2 -lm \
+              > ../B197_logs/bambu_hls.log 2>&1
+          )
+          HLS_RC=$?
+          set -e
+          echo "B197_BAMBU_HLS_EXIT=$HLS_RC"
+          tail -100 B197_logs/bambu_hls.log
+          find build -maxdepth 3 -type f \( -name '*.v' -o -name '*.vhd' \) -printf '%p %s bytes\n' > B197_logs/generated_hdl_inventory.txt
+          cat B197_logs/generated_hdl_inventory.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          text=Path('B197_logs/bambu_hls.log').read_text(errors='replace')
+          files=Path('B197_logs/generated_hdl_inventory.txt').read_text().splitlines()
+          result={'status':'ATTEMPTED_HLS_FRONTEND_GATE_NOT_KV260','tool':'Bambu 2024.10 AppImage','original_source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d','substituted_native_only_ap_int_header':True,'hls_log_bytes':len(text),'generated_hdl_inventory':files,'not_vitis_hls':True,'not_GDN_hardware_PPA':True,'not_routed':True}
+          Path('B197_logs/bambu_gate.json').write_text(json.dumps(result,indent=2))
+          print('B197_BAMBU_HLS_COMPAT_GATE_REPORT',json.dumps(result))
+          PY
+          if [ "$HLS_RC" -ne 0 ]; then echo 'B197_BAMBU_HLS_BLOCKED_WITH_FAILURE_RECEIPT'; exit "$HLS_RC"; fi
+          test -s B197_logs/generated_hdl_inventory.txt
+          echo 'B197_BAMBU_ORIGINAL_GDN_HLS_GENERATED_HDL_BUT_UNVERIFIED'
+      - name: Archive compiler logs only, no upstream source or generated derivatives
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-Bambu-open-HLS-gate
+          path: B197_logs/
+          retention-days: 8
+          if-no-files-found: warn
