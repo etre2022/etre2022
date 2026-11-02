@@ -44,7 +44,7 @@ jobs:
           g++ $FLAGS $INC -DBUILD_DECODE_KERNEL -c upstream/src/decode.cpp -o build/kernel.o 2>&1 | tee logs/kernel_build.log
           g++ $FLAGS $INC -DUSE_CPU_ONLY -c upstream/src/decode.cpp -o build/cpu.o 2>&1 | tee logs/cpu_build.log
           g++ $FLAGS $INC -c upstream/src/weight.cpp -o build/weight.o 2>&1 | tee logs/weight_build.log
-          g++ $FLAGS $INC -c b197/native_only_compat/test_reset_reference.cpp -o build/test.o 2>&1 | tee logs/test_build.log
+          g++ $FLAGS $INC -DUSE_CPU_ONLY -c b197/native_only_compat/test_reset_reference.cpp -o build/test.o 2>&1 | tee logs/test_build.log
           g++ build/kernel.o build/cpu.o build/weight.o build/test.o -lm -o build/test
           timeout 300s build/test /tmp/b197_meta_fix.bin 2>&1 | tee logs/native_reset_448.log
           grep -q '^B197_GDN_NATIVE_RESET_4_SESSIONS_PASS total_compare_points=448' logs/native_reset_448.log
