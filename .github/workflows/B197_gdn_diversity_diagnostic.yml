@@ -2,7 +2,7 @@ name: B197 GDN native diversity mismatch and reset diagnostic
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/B197_gdn_diversity_diagnostic.yml']
+    paths: ['.github/workflows/B197_gdn_diversity_diagnostic.yml', 'b197/native_only_compat/test_diversity_diagnostic.cpp']
   workflow_dispatch:
 permissions:
   contents: read
