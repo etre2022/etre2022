@@ -1,0 +1,99 @@
+name: B197 GDN mismatches CPU logit-margin diagnostic
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_random_mismatch_margin.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  margin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Original pinned CPU logits at five native-kernel mismatch steps
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          exec > >(tee evidence/full_stdout_stderr.log) 2>&1
+          trap 'rc=$?; echo "B197_MARGIN_EXIT=$rc"; date -u -Is' EXIT
+          echo "B197_SCOPE=CPU_LOGIT_MARGIN_ONLY_NO_HLS_HARDWARE_OR_FPGA_PPA"
+          date -u -Is; g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          cp upstream/model/tinystories15M_q8.bin /tmp/B197_gdn_checked.bin
+          python3 - <<'PY'
+          import hashlib,struct
+          from pathlib import Path
+          p=Path('/tmp/B197_gdn_checked.bin')
+          a=bytearray(p.read_bytes())
+          assert hashlib.sha256(a).hexdigest()=='63fe5c9bca6bbf7abfd05ab5c67e9fb58d8ba25d4184a65d22e04c9179e78b64'
+          assert struct.unpack_from('<i',a,40)[0]==256
+          struct.pack_into('<i',a,40,1024)
+          p.write_bytes(a)
+          assert hashlib.sha256(a).hexdigest()=='7dbe38e0115c94cdeff3f4acb7127a74efddd8843c7915c287a928d57ba497f0'
+          print('B197_META_ONLY_CHECKPOINT_SHIM_PASS')
+          PY
+          cat > evidence/logit_margins.cpp <<'CPP'
+          #include "decode.hpp"
+          #include "weight.hpp"
+          #include <random>
+          #include <vector>
+          #include <algorithm>
+          #include <cmath>
+          #include <limits>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          struct Mismatch {int pos,kernel_id;};
+          int main(int argc,char** argv) {
+            if(argc!=2)return 91;
+            const Mismatch failure[5]={{33,5461},{43,6089},{52,29889},{107,14238},{118,14238}};
+            gdn::Weights w;gdn::LoadWeights(w,argv[1]);
+            gdn::RunState state;
+            std::vector<float> logits(gdn::kVocabSize,0.0f);
+            std::mt19937 rng(197);
+            std::uniform_int_distribution<int> dist(1,gdn::kVocabSize-1);
+            int fi=0,finite_fail=0;
+            for(int t=0;t<128;t++){
+              int token=dist(rng);
+              gdn::CpuForward(state,w,token,logits.data());
+              if(fi>=5 || t!=failure[fi].pos)continue;
+              int kernel= failure[fi].kernel_id;
+              int cpu=gdn::ArgmaxLogits(logits.data(),gdn::kVocabSize);
+              int second=-1;
+              for(int k=0;k<gdn::kVocabSize;k++){
+                if(!std::isfinite(logits[k]))finite_fail++;
+                if(k==cpu)continue;
+                if(second<0 || logits[k]>logits[second])second=k;
+              }
+              double top=(double)logits[cpu], runner=(double)logits[second], kv=(double)logits[kernel];
+              int candidate_rank=1;
+              for(int k=0;k<gdn::kVocabSize;k++)if(logits[k]>logits[kernel])candidate_rank++;
+              float max_abs_state=0;
+              int nonfinite_state=0;
+              for(float s:state.S){if(!std::isfinite(s))nonfinite_state++;else max_abs_state=std::max(max_abs_state,std::abs(s));}
+              printf("B197_CPU_MISMATCH_DIAGNOSTIC t=%d input=%d cpu=%d kernel=%d second=%d top_logit=%.9g second_logit=%.9g top2_gap=%.9g kernel_logit=%.9g gap_to_kernel=%.9g kernel_rank=%d max_abs_state=%.9g nonfinite_state=%d\n",
+               t,token,cpu,kernel,second,top,runner,top-runner,kv,top-kv,candidate_rank,(double)max_abs_state,nonfinite_state);
+              fi++;
+            }
+            if(fi!=5||finite_fail) {fprintf(stderr,"CHECK_FAILED fi=%d nonfinite_logits=%d\n",fi,finite_fail);return 78;}
+            puts("B197_GDN_CPU_MISMATCH_MARGIN_AUDIT_PASS_five_points");
+            return 0;
+          }
+          CPP
+          g++ -O2 -std=c++20 -ffp-contract=off -fno-fast-math -DUSE_CPU_ONLY -Iupstream/src upstream/src/decode.cpp upstream/src/weight.cpp evidence/logit_margins.cpp -o /tmp/B197_gdn_margins
+          timeout 180s /tmp/B197_gdn_margins /tmp/B197_gdn_checked.bin | tee evidence/mismatch_margins.log
+          echo B197_GDN_CPU_MARGINS_EXTRACTED
+          sha256sum upstream/src/decode.cpp upstream/src/config.hpp evidence/logit_margins.cpp > evidence/source_hashes.txt
+      - name: Preserve logs and independent diagnostic harness only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-random-mismatch-CPU-logit-margins
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: warn
