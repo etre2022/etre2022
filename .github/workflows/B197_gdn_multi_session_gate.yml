@@ -1,0 +1,71 @@
+name: B197 GDN original kernel multi-session reset gate
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/B197_gdn_multi_session_gate.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-reset:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Original HLS kernel vs original CPU across repeated resets and 448 steps
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs build
+          exec > >(tee logs/full.log) 2>&1
+          trap 'rc=$?; echo "B197_RESET_GATE_EXIT=$rc"; date -u -Is' EXIT
+          echo 'B197_TEST_SCOPE=native_cpp_emulation_not_vitis_or_FPGA'
+          date -u -Is; uname -a; g++ --version | head -1
+          git clone --filter=blob:none --no-checkout https://github.com/ruhai-lin/gdn.hls.git upstream
+          git -C upstream checkout --detach 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          test "$(git -C upstream rev-parse HEAD)" = 45a7e14315d78e2c38b93e740cb0e4fb3f032c4d
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct,hashlib,json
+          p=Path('upstream/model/tinystories15M_q8.bin')
+          data=bytearray(p.read_bytes()); orig=hashlib.sha256(data).hexdigest()
+          assert orig=='63fe5c9bca6bbf7abfd05ab5c67e9fb58d8ba25d4184a65d22e04c9179e78b64'
+          assert struct.unpack_from('<i',data,40)[0]==256
+          struct.pack_into('<i',data,40,1024)
+          sha=hashlib.sha256(data).hexdigest()
+          assert sha=='7dbe38e0115c94cdeff3f4acb7127a74efddd8843c7915c287a928d57ba497f0'
+          Path('/tmp/b197_meta_fix.bin').write_bytes(data)
+          Path('logs/weight_provenance.json').write_text(json.dumps({'original_sha256':orig,'shim_sha256':sha,'only_byte_changed':41,'not_original_upstream_as_is':True},indent=2))
+          print('B197_META_CHECKPOINT_SHA_PASS')
+          PY
+          sha256sum upstream/src/decode.cpp upstream/src/weight.cpp b197/native_only_compat/ap_int.h b197/native_only_compat/test_reset_reference.cpp > logs/source_sha256.txt
+          INC="-Ib197/native_only_compat -Iupstream/src"
+          FLAGS="-O2 -std=c++20 -ffp-contract=off -fno-fast-math -Wno-unknown-pragmas"
+          g++ $FLAGS $INC -DBUILD_DECODE_KERNEL -c upstream/src/decode.cpp -o build/kernel.o 2>&1 | tee logs/kernel_build.log
+          g++ $FLAGS $INC -DUSE_CPU_ONLY -c upstream/src/decode.cpp -o build/cpu.o 2>&1 | tee logs/cpu_build.log
+          g++ $FLAGS $INC -c upstream/src/weight.cpp -o build/weight.o 2>&1 | tee logs/weight_build.log
+          g++ $FLAGS $INC -c b197/native_only_compat/test_reset_reference.cpp -o build/test.o 2>&1 | tee logs/test_build.log
+          g++ build/kernel.o build/cpu.o build/weight.o build/test.o -lm -o build/test
+          timeout 300s build/test /tmp/b197_meta_fix.bin 2>&1 | tee logs/native_reset_448.log
+          grep -q '^B197_GDN_NATIVE_RESET_4_SESSIONS_PASS total_compare_points=448' logs/native_reset_448.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          t=Path('logs/native_reset_448.log').read_text()
+          matches=re.findall(r'^B197_SCENARIO_PASS (\d+) steps=(\d+) repeated_A=(\S+)$',t,re.M)
+          assert matches==[('0','64','n/a'),('1','64','n/a'),('2','64','yes'),('3','256','n/a')],matches
+          report={'status':'PASS_NATIVE_EMULATION_ONLY','source_commit':'45a7e14315d78e2c38b93e740cb0e4fb3f032c4d','original_kernel_unchanged':True,'4_sessions':4,'steps_per_session':[64,64,64,256],'cpu_match':448,'cpu_mismatch':0,'repeated_scenario_first_third_identical':True,'rtl_cosimulation':False,'onchip_ppa':False}
+          Path('logs/result.json').write_text(json.dumps(report,indent=2))
+          print('B197_GDN_RESET_SEMANTIC_GATE_PASS',json.dumps(report))
+          PY
+      - name: Archive public log and self-authored shim/test; exclude source and model
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B197-GDN-native-reset-gate
+          path: |
+            logs/
+            b197/native_only_compat/ap_int.h
+            b197/native_only_compat/test_reset_reference.cpp
+          retention-days: 8
+          if-no-files-found: warn
